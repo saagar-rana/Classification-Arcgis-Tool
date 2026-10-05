@@ -6,7 +6,7 @@ import sys
 import types
 from types import SimpleNamespace
 
-
+#sagar
 def load_dgcnn(models_dir): 
     """Load the original DGCNN and its relative imports in a private namespace. 
 
@@ -50,7 +50,7 @@ def load_dgcnn(models_dir):
         raise
 
 
-def build_dgcnn(models_dir, num_classes):
+def build_dgcnn(models_dir , num_classes):
     config = SimpleNamespace(num_classes=num_classes, channels_input=7,
                              k=20, emb_dims=1024, dropout=0.3)
     return load_dgcnn(models_dir)(config=config)
