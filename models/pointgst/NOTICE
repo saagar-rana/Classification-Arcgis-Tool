@@ -1,0 +1,14 @@
+PointGST
+Copyright (c) 2024 Dingkang Liang, Tianrui Feng, Xin Zhou, Yumeng Zhang,
+              Zhikang Zou, Xiang Bai
+
+Original repository: https://github.com/jerryfeng2003/PointGST
+Paper: "Parameter-Efficient Fine-Tuning in Spectral Domain for
+       Point Cloud Learning", IEEE TPAMI
+
+This is a derivative work adapted for the LIDARLearn library.
+Changes from the original:
+  - Integrated into the LIDARLearn model registry and config system
+  - Split into PointGST (PointMAE backbone) and PointGPT_GST (PointGPT backbone)
+  - Uses BasePointCloudModel base class
+  - Adapted constructor to accept config objects

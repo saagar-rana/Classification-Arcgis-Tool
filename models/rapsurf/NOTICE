@@ -1,0 +1,11 @@
+RepSurf
+Copyright (c) 2022 Haoxi Ran
+
+Original repository: https://github.com/hancyran/RepSurf
+Paper: "Surface Representation for Point Clouds", CVPR 2022
+
+This is a derivative work adapted for the LIDARLearn library.
+Changes from the original:
+  - Integrated into the LIDARLearn model registry and config system
+  - Uses BasePointCloudModel base class
+  - Adapted constructor to accept config objects

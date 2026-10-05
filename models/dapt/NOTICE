@@ -1,0 +1,13 @@
+DAPT
+Copyright (c) 2024 Xin Zhou, Dingkang Liang, Wei Xu, Xingkui Zhu, Yihan Xu, Zhikang Zou, Xiang Bai
+
+Original repository: https://github.com/LMD0311/DAPT
+Paper: "DAPT: Domain Adapter with Pre-Trained Models for Point Cloud
+       Understanding"
+
+This is a derivative work adapted for the LIDARLearn library.
+Changes from the original:
+  - Integrated into the LIDARLearn model registry and config system
+  - Split into DAPT (PointMAE backbone) and PointGPT_DAPT (PointGPT backbone)
+  - Uses BasePointCloudModel base class
+  - Adapted constructor to accept config objects
