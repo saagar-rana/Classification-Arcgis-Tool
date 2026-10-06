@@ -19,6 +19,23 @@ import laspy
 # from ..pointtransformerv3.pointtransformerv3 import PointTransformerV3
 
 import sys
+import json
+from datetime import datetime, timezone
+
+
+def save_model_metadata(weights_path, metadata):
+    """Write a JSON sidecar without changing the existing .pth format."""
+    metadata_path = os.path.splitext(weights_path)[0] + ".metadata.json"
+    temporary_path = metadata_path + ".tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as stream:
+            json.dump(metadata, stream, indent=2, ensure_ascii=False, allow_nan=False)
+            stream.write("\n")
+        os.replace(temporary_path, metadata_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+    return metadata_path
 
 # 1. Get the exact path to the folder containing this .pyt file ("Classification toolbox")
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -368,22 +385,60 @@ class Classification:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         arcpy.AddMessage(f"Using device: {device}")
 
+        import importlib.util
+        adapter_path = os.path.join(current_dir, "model_adapter.py")
+        spec = importlib.util.spec_from_file_location("quebec_model_adapter", adapter_path)
+        adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adapter)
+
         if model_type == "PointNet":
-            from pointnet.pointnet import PointNet
+            PointNet = adapter.load_local_model(parent_dir, "pointnet", "PointNet")
+            model_config = vars(pointnet_config).copy()
             model = PointNet(config=pointnet_config).to(device)
         elif model_type == "PointTransformerV3":
-            from pointtransformerv3.pointtransformerv3 import PointTransformerV3
+            PointTransformerV3 = adapter.load_local_model(parent_dir, "pointtransformerv3", "PointTransformerV3")
+            model_config = vars(ptv3_config).copy()
             model = PointTransformerV3(config=ptv3_config).to(device)
         elif model_type == "DGCNN":
-            import importlib.util
-            adapter_path = os.path.join(current_dir, "model_adapter.py")
-            spec = importlib.util.spec_from_file_location("quebec_model_adapter", adapter_path)
-            adapter = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(adapter)
             model = adapter.build_dgcnn(os.path.join(parent_dir, "models"), len(classes)).to(device)
+            model_config = vars(model.config).copy()
         else:
             raise ValueError(f"Unsupported model type: {model_type}")
         arcpy.AddMessage(f"Training {model_type} with batch size {batch_size}.")
+
+        # Preserve the exact output-index order used by this training run.
+        metadata = {
+            "schema_version": 1,
+            "model_type": model_type,
+            "model_config": model_config,
+            "weights_file": os.path.basename(save_path),
+            "classes": list(classes),
+            "class_to_index": {name: index for index, name in enumerate(classes)},
+            "input_features": ["x", "y", "z", "red", "green", "blue", "intensity"],
+            "preprocessing": {
+                "version": 1,
+                "num_points": 4096,
+                "minimum_source_points": 4096,
+                "sampling": "random without replacement on each load",
+                "coordinates": "subtract sampled mean x/y and sampled minimum z; no scale normalization",
+                "rgb_divisor": 65535.0,
+                "intensity": "subtract sampled median, divide by sampled IQR, then subtract minimum",
+                "zero_iqr_replacement": 1e-6,
+            },
+            "training": {
+                "requested_epochs": int(num_epochs),
+                "batch_size": batch_size,
+                "train_split": float(train_split),
+                "early_stopping_patience": int(patience),
+                "optimizer": "Adam",
+                "initial_learning_rate": 0.001,
+                "split_method": "random file split",
+                "train_samples": train_size,
+                "validation_samples": test_size,
+                "drop_last_training_batch": train_size % batch_size == 1,
+            },
+            "environment": {"torch_version": str(torch.__version__), "device": str(device)},
+        }
 
         # Compute Class Weights for CrossEntropyLoss
         class_counts = [total_classes[c] for c in classes]
@@ -468,7 +523,15 @@ class Classification:
                 best_loss = avg_test_loss
                 patience_counter = 0
                 torch.save(model.state_dict(), save_path)
+                metadata["checkpoint"] = {
+                    "epoch": epoch + 1,
+                    "validation_loss": float(avg_test_loss),
+                    "validation_accuracy_percent": float(accuracy),
+                    "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+                }
+                metadata_path = save_model_metadata(save_path, metadata)
                 arcpy.AddMessage(f"Model weights saved to {save_path}")
+                arcpy.AddMessage(f"Model metadata saved to {metadata_path}")
             else:
                 patience_counter += 1
                 if patience_counter >= patience:

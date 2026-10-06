@@ -7,6 +7,31 @@ import types
 from types import SimpleNamespace
 
 
+def load_local_model(project_dir, package_name, class_name):
+    """Load a sibling model package by path, independent of ArcGIS sys.path."""
+    package_dir = os.path.join(project_dir, package_name)
+    source_path = os.path.join(package_dir, package_name + ".py")
+    if not os.path.isfile(source_path):
+        raise FileNotFoundError(f"Model source not found: {source_path}")
+    namespace = "_quebec_toolbox_" + package_name
+    module_name = namespace + "." + package_name
+    if module_name not in sys.modules:
+        package = types.ModuleType(namespace)
+        package.__path__ = [package_dir]
+        sys.modules[namespace] = package
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, source_path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+        except Exception:
+            for name in list(sys.modules):
+                if name == namespace or name.startswith(namespace + "."):
+                    sys.modules.pop(name, None)
+            raise
+    return getattr(sys.modules[module_name], class_name)
+
+
 def load_dgcnn(models_dir): 
     """Load the original DGCNN and its relative imports in a private namespace. 
 
