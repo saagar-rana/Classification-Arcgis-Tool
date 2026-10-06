@@ -481,3 +481,5 @@ class Classification:
         """This method takes place after outputs are processed and
         added to the display."""
         return
+
+# End of Point Cloud Classification script
