@@ -19,7 +19,44 @@ import laspy
 
 import sys
 import json
+import csv
 from datetime import datetime, timezone
+
+
+def read_split_csv(filename):
+    """Read explicit labels and memberships; reject duplicate or invalid rows."""
+    splits = {"training": [], "validation": [], "testing": []}
+    labels, seen = {}, set()
+    with open(filename, encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if not reader.fieldnames:
+            raise ValueError("Split CSV is empty.")
+        reader.fieldnames = [name.strip().upper() for name in reader.fieldnames]
+        if not {"FILE_PATH", "CLASS_NAME", "SPLIT"} <= set(reader.fieldnames):
+            raise ValueError("CSV requires FILE_PATH, CLASS_NAME, and SPLIT columns.")
+        for line, row in enumerate(reader, start=2):
+            path = (row.get("FILE_PATH") or "").strip()
+            species = (row.get("CLASS_NAME") or "").strip()
+            subset = (row.get("SPLIT") or "").strip().lower()
+            if not path or not species or subset not in splits:
+                raise ValueError(f"Invalid path, class, or split on CSV line {line}.")
+            if not os.path.isabs(path):
+                path = os.path.join(os.path.dirname(os.path.abspath(filename)), path)
+            path = os.path.abspath(path)
+            key = os.path.normcase(os.path.realpath(path))
+            if key in seen:
+                raise ValueError(f"Duplicate file across CSV rows: {path}")
+            seen.add(key)
+            splitter_module.validate_las(path, minimum_points=1)
+            splits[subset].append(path)
+            labels[path] = species
+    if len(splits["training"]) < 2 or not splits["validation"]:
+        raise ValueError("CSV needs at least two training files and one validation file.")
+    classes = sorted({labels[path] for path in splits["training"]})
+    unknown = {labels[path] for path in splits["validation"] + splits["testing"]} - set(classes)
+    if unknown:
+        raise ValueError(f"Validation/testing classes absent from training: {', '.join(sorted(unknown))}")
+    return splits, labels, classes
 
 
 def save_model_metadata(weights_path, metadata):
@@ -77,212 +114,68 @@ class Classification:
         self.canRunInBackground = False
 
     def getParameterInfo(self):
-        """Define the tool parameters."""
-        # 1. Input Dataset Directory
-        in_folder = arcpy.Parameter(
-            displayName="Dataset Directory (Contains Class Folders)",
-            name="in_folder",
-            datatype="DEFolder",
-            parameterType="Required",
-            direction="Input"
-        )
-
-        selected_classes = arcpy.Parameter(
-            displayName="Select Classes for Training",
-            name="selected_classes",
-            datatype="GPString",
-            parameterType="Required",
-            direction="Input",
-            multiValue=True
-        )
-        selected_classes.parameterDependencies = [in_folder.name]
-
-        # 2. Number of Epochs
-        epochs = arcpy.Parameter(
-            displayName="Number of Epochs",
-            name="epochs",
-            datatype="GPLong",
-            parameterType="Required",
-            direction="Input"
-        )
-        epochs.value = 50 # Default value
-
-        train_split = arcpy.Parameter(
-            displayName="Training Data Split (0-1)",
-            name="train_split",
-            datatype="GPDouble",
-            parameterType="Required",
-            direction="Input"
-        )
-        train_split.value = 0.8 # Default value
-
-        model_names = ["PointNet", "PointTransformerV3", "DGCNN"]
-        model_type = arcpy.Parameter(
-            displayName="Model Type",
-            name="model_type",
-            datatype="GPString",
-            parameterType="Required",   
-            direction="Input"
-        )
-        model_type.filter.list = model_names
-        model_type.value = "PointNet"
-
-        batch_size = arcpy.Parameter(
-            displayName="Batch Size",
-            name="batch_size",
-            datatype="GPLong",
-            parameterType="Required",
-            direction="Input"
-        )
-        batch_size.value = 20
-        batch_size.filter.type = "Range"
-        batch_size.filter.list = [2, 2147483647]
-
-        patience = arcpy.Parameter(
-            displayName="Patience for Early Stopping",
-            name="patience",
-            datatype="GPLong",
-            parameterType="Required",
-            direction="Input"
-        )
-        patience.value = 5 # Default value
-
-        pretrained_model = arcpy.Parameter(
-            displayName="Pretrained Model Weights (.pth)",
-            name="pretrained_model",
-            datatype="DEFile",  
-            parameterType="Optional",
-            direction="Input"
-        )
-        
-        # 3. Output Weights File (.pth)
-        out_pth = arcpy.Parameter(
-            displayName="Output Model Weights (.pth)",
-            name="out_pth",
-            datatype="DEFile",
-            parameterType="Required",
-            direction="Output"
-        )
-
-        # Append the parameter to preserve the existing parameter indices.
-        return [in_folder, selected_classes, epochs, train_split, model_type, patience, pretrained_model, out_pth, batch_size]
+        definitions = [
+            ("Input Split CSV", "split_csv", "DEFile", "Required", "Input"),
+            ("Number of Epochs", "epochs", "GPLong", "Required", "Input"),
+            ("Model Type", "model_type", "GPString", "Required", "Input"),
+            ("Batch Size", "batch_size", "GPLong", "Required", "Input"),
+            ("Points per Tree", "num_points", "GPLong", "Required", "Input"),
+            ("Patience for Early Stopping", "patience", "GPLong", "Required", "Input"),
+            ("Pretrained Model Weights (.pth)", "pretrained_model", "DEFile", "Optional", "Input"),
+            ("Output Model Weights (.pth)", "out_pth", "DEFile", "Required", "Output"),
+        ]
+        params = [arcpy.Parameter(displayName=label, name=name, datatype=dtype,
+                                  parameterType=required, direction=direction)
+                  for label, name, dtype, required, direction in definitions]
+        params[0].filter.list = ["csv"]
+        params[1].value = 50
+        params[2].filter.list = ["PointNet", "PointTransformerV3", "DGCNN"]
+        params[2].value = "PointNet"
+        params[3].value = 20
+        params[3].filter.type = "Range"
+        params[3].filter.list = [2, 2147483647]
+        params[4].value = 4096
+        params[4].filter.type = "Range"
+        params[4].filter.list = [20, 2147483647]
+        params[5].value = 5
+        params[6].filter.list = ["pth"]
+        params[7].filter.list = ["pth"]
+        return params
 
     def isLicensed(self):
-        """Set whether the tool is licensed to execute."""
         return True
 
     def updateParameters(self, parameters):
-        """Modify the values and properties of parameters before internal
-        validation is performed.  This method is called whenever a parameter
-        has been changed."""
-        dir_path = parameters[0].valueAsText
-        if not parameters[8].altered:
-            parameters[8].value = 2 if parameters[4].valueAsText == "DGCNN" else 20
-        classes = []
-        if not dir_path or not os.path.isdir(dir_path):
-            parameters[1].filter.list = classes
-            return
-        for folder_name in os.listdir(dir_path):
-                    folder_path = os.path.join(dir_path, folder_name)
-                    if os.path.isdir(folder_path):
-                        for class_name in os.listdir(folder_path):
-                            class_path = os.path.join(folder_path, class_name)
-                            if os.path.isdir(class_path):
-    
-                                
-                                if class_name not in classes:
-                                    classes.append(class_name)
-
-        parameters[1].filter.list = classes
-        return
+        if not parameters[3].altered:
+            parameters[3].value = 2 if parameters[2].valueAsText == "DGCNN" else 20
 
     def updateMessages(self, parameters):
-        """Modify the messages created by internal validation for each tool
-        parameter. This method is called after internal validation."""
-        if parameters[8].value is not None and int(parameters[8].value) < 2:
-            parameters[8].setErrorMessage("Batch size must be at least 2 for training with batch normalization.")
-        return
+        for index, minimum, label in ((1, 1, "Epochs"), (3, 2, "Batch size"),
+                                       (4, 20, "Points per tree"), (5, 1, "Patience")):
+            if parameters[index].value is not None and int(parameters[index].value) < minimum:
+                parameters[index].setErrorMessage(f"{label} must be at least {minimum}.")
 
     def execute(self, parameters, messages):
-        """The source code of the tool."""
-        dir_path = parameters[0].valueAsText
-        selected_classes = parameters[1].valueAsText.split(";")
-        num_epochs = parameters[2].value
-        train_split = parameters[3].value
-        model_type = parameters[4].valueAsText
-        patience = parameters[5].value
+        split_csv = parameters[0].valueAsText
+        num_epochs = int(parameters[1].value)
+        model_type = parameters[2].valueAsText
+        batch_size = int(parameters[3].value)
+        num_points = int(parameters[4].value)
+        patience = int(parameters[5].value)
         pretrained_model = parameters[6].valueAsText
         save_path = parameters[7].valueAsText
-        batch_size = int(parameters[8].value)
-        if batch_size < 2:
-            raise ValueError("Batch size must be at least 2 for training with batch normalization.")
-
-        # # Parse selected classes
-        # selected_class_names = []
-        # if selected_classes:
-        #     # ArcGIS Pro passes multivalue strings as semicolon separated, sometimes with single quotes
-        #     items = selected_classes.replace("'", "").split(";")
-        #     # Extract just the class name before the " (X instances)"
-        #     selected_class_names = [item.split(" (")[0].strip() for item in items]
-
-        arcpy.AddMessage(f"Selected classes: {selected_classes}")
-        file_paths = []
-        classes = []
-        total_classes = {}
-        for folder_name in os.listdir(dir_path):
-                    folder_path = os.path.join(dir_path, folder_name)
-                    if os.path.isdir(folder_path):
-                        for class_name in os.listdir(folder_path):
-                            class_path = os.path.join(folder_path, class_name)
-                            if os.path.isdir(class_path):
-                                for file_name in os.listdir(class_path):
-                                    print(f"Processing file: {file_name}")
-                                    if file_name.endswith(".las"):
-                                        file_paths.append(os.path.join(class_path, file_name))
-                                
-                                if class_name not in classes:
-                                    classes.append(class_name)
-
-        # Filter classes based on selected_classes
-        if selected_classes:
-            classes = [cls for cls in classes if cls in selected_classes]
-            file_paths = [fp for fp in file_paths if fp.split('\\')[-2] in classes]
-            arcpy.AddMessage(f"Filtered classes: {classes}")
-            arcpy.AddMessage(f"Filtered file paths: {len(file_paths)} files")
-            
-        # print(f"Found {len(file_paths)} .las files across {len(classes)} classes: {classes}")
-
-
-        for file in file_paths:
-            name = file.split('\\')[-2]
-            if name not in total_classes:
-                total_classes[name] = 0
-            total_classes[name] += 1
-
-
-        arcpy.AddMessage(f"Found {len(file_paths)} .las files across {len(classes)} classes: {classes}")
-
-        # Filter valid files (must have >= 4096 points)
-        valid_paths = []
-        for path in file_paths:
-            try:
-                las_file = laspy.read(path)
-                if len(las_file.points) >= 4096:
-                    valid_paths.append(path)
-                del las_file
-            except Exception as e:
-                pass # Ignore problematic files
-
-        final_paths = valid_paths
-        arcpy.AddMessage(f"Retained {len(final_paths)} valid files with sufficient points.")
-
-        if len(final_paths) == 0:
-            arcpy.AddError("No valid .las files found with >= 4096 points.")
-            return
+        if num_epochs < 1 or patience < 1 or batch_size < 2 or num_points < 20:
+            raise ValueError("Use positive epochs/patience, batch size >=2, and points per tree >=20.")
+        splits, file_labels, classes = read_split_csv(split_csv)
+        train_size = len(splits["training"])
+        test_size = len(splits["validation"])
+        total_classes = {name: sum(file_labels[path] == name for path in splits["training"]) for name in classes}
+        arcpy.AddMessage(f"Classes from CSV: {classes}")
+        arcpy.AddMessage(f"CSV splits: {train_size} training, {test_size} validation, {len(splits['testing'])} testing files. Memberships are preserved.")
+        arcpy.AddMessage(f"Sampling {num_points} points per tree; smaller files are sampled with replacement.")
 
         # --- Normalization & Data Loading ---
         def get_data(final_path, final_classes):
-            num_points = 4096
             las_file = laspy.read(final_path)
             
             classification = np.copy(las_file.classification)
@@ -329,7 +222,7 @@ class Classification:
 
             # Combine all 7 features into tensor
             data = np.hstack((n_coords, colors, n_intensity[:, np.newaxis]))
-            cls_name = os.path.basename(os.path.dirname(final_path))
+            cls_name = file_labels[final_path]
             class_idx = final_classes.index(cls_name)
         
             return data, class_idx
@@ -349,11 +242,8 @@ class Classification:
                 return torch.tensor(data, dtype=torch.float32), torch.tensor(classification, dtype=torch.long)  
              
             
-        dataset = PointCloudDataset(final_paths, classes)
-        
-        train_size = int(train_split * len(dataset))
-        test_size = len(dataset) - train_size
-        train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
+        train_dataset = PointCloudDataset(splits["training"], classes)
+        test_dataset = PointCloudDataset(splits["validation"], classes)
         
         if train_size < 2 or test_size < 1:
             raise ValueError("The data split must contain at least two training trees and one validation tree.")
@@ -424,9 +314,9 @@ class Classification:
             "input_features": ["x", "y", "z", "red", "green", "blue", "intensity"],
             "preprocessing": {
                 "version": 1,
-                "num_points": 4096,
-                "minimum_source_points": 4096,
-                "sampling": "random without replacement on each load",
+                "num_points": num_points,
+                "minimum_source_points": 1,
+                "sampling": "random on each load; with replacement when source has fewer than num_points",
                 "coordinates": "subtract sampled mean x/y and sampled minimum z; no scale normalization",
                 "rgb_divisor": 65535.0,
                 "intensity": "subtract sampled median, divide by sampled IQR, then subtract minimum",
@@ -435,11 +325,13 @@ class Classification:
             "training": {
                 "requested_epochs": int(num_epochs),
                 "batch_size": batch_size,
-                "train_split": float(train_split),
+                "train_split": train_size / (train_size + test_size),
                 "early_stopping_patience": int(patience),
                 "optimizer": "Adam",
                 "initial_learning_rate": 0.001,
-                "split_method": "random file split",
+                "split_method": "CSV manifest",
+                "split_csv": os.path.abspath(split_csv),
+                "testing_samples": len(splits["testing"]),
                 "train_samples": train_size,
                 "validation_samples": test_size,
                 "drop_last_training_batch": train_size % batch_size == 1,
@@ -519,8 +411,8 @@ class Classification:
             avg_test_loss = test_loss / len(test_loader)
             accuracy = 100 * correct / total
 
-            arcpy.AddMessage(f"Test Accuracy: {accuracy:.2f}%")
-            arcpy.AddMessage(f"Test Loss: {avg_test_loss:.4f}")
+            arcpy.AddMessage(f"Validation Accuracy: {accuracy:.2f}%")
+            arcpy.AddMessage(f"Validation Loss: {avg_test_loss:.4f}")
 
             # Step the scheduler based on the validation loss
             scheduler.step(avg_test_loss)
@@ -545,6 +437,22 @@ class Classification:
                     arcpy.AddMessage("Early stopping triggered.")
                     break
 
+        if splits["testing"]:
+            if not np.isfinite(best_loss):
+                raise ValueError("No finite best checkpoint was saved; testing cannot proceed.")
+            model.load_state_dict(torch.load(save_path, map_location=device, weights_only=True))
+            model.eval()
+            testing_loader = DataLoader(PointCloudDataset(splits["testing"], classes), batch_size=batch_size, shuffle=False)
+            testing_correct, testing_total = 0, 0
+            with torch.no_grad():
+                for point_clouds, labels in testing_loader:
+                    predictions = model(point_clouds.to(device)).argmax(dim=1)
+                    testing_correct += (predictions == labels.to(device)).sum().item()
+                    testing_total += len(labels)
+            testing_accuracy = 100 * testing_correct / testing_total
+            arcpy.AddMessage(f"Held-out Testing Accuracy (best checkpoint): {testing_accuracy:.2f}%")
+            metadata["testing"] = {"samples": testing_total, "accuracy_percent": testing_accuracy}
+            save_model_metadata(save_path, metadata)
         return
 
     def postExecute(self, parameters):
