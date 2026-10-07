@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 
 import arcpy
-import arcpy
 import os
 import torch
 import torch.nn as nn
@@ -40,6 +39,14 @@ def save_model_metadata(weights_path, metadata):
 # 1. Get the exact path to the folder containing this .pyt file ("Classification toolbox")
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
+# Load the sibling module by path so ArcGIS does not need it on sys.path.
+import importlib.util
+splitter_spec = importlib.util.spec_from_file_location(
+    "quebec_tree_splitter", os.path.join(current_dir, "splitter.py"))
+splitter_module = importlib.util.module_from_spec(splitter_spec)
+splitter_spec.loader.exec_module(splitter_module)
+SplitTreeDataset = splitter_module.SplitTreeDataset
+
 # 2. Get the path to the parent folder ("DATASETS")
 parent_dir = os.path.dirname(current_dir)
 
@@ -59,7 +66,7 @@ class Toolbox:
         self.alias = "toolbox"
 
         # List of tool classes associated with this toolbox
-        self.tools = [Classification]
+        self.tools = [SplitTreeDataset, Classification]
 
 
 class Classification:
@@ -243,7 +250,7 @@ class Classification:
             arcpy.AddMessage(f"Filtered classes: {classes}")
             arcpy.AddMessage(f"Filtered file paths: {len(file_paths)} files")
             
-        print(f"Found {len(file_paths)} .las files across {len(classes)} classes: {classes}")
+        # print(f"Found {len(file_paths)} .las files across {len(classes)} classes: {classes}")
 
 
         for file in file_paths:
@@ -545,4 +552,3 @@ class Classification:
         added to the display."""
         return
 
-# End of Point Cloud Classification script
