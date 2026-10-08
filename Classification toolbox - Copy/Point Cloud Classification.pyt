@@ -20,6 +20,7 @@ import laspy
 import sys
 import json
 import csv
+import time
 from datetime import datetime, timezone
 
 
@@ -72,6 +73,53 @@ def save_model_metadata(weights_path, metadata):
         if os.path.exists(temporary_path):
             os.remove(temporary_path)
     return metadata_path
+
+
+def write_evaluation_reports(weights_path, subset, classes, actual, predicted):
+    """Export metrics in class-index order; zero-denominator metrics are zero."""
+    if not actual or len(actual) != len(predicted):
+        raise ValueError("Evaluation requires matching, nonempty actual/predicted labels.")
+    matrix = np.zeros((len(classes), len(classes)), dtype=np.int64)
+    for truth, guess in zip(actual, predicted):
+        if not 0 <= truth < len(classes) or not 0 <= guess < len(classes):
+            raise ValueError("Evaluation label is outside the saved class mapping.")
+        matrix[truth, guess] += 1
+    supports = matrix.sum(axis=1)
+    predicted_counts = matrix.sum(axis=0)
+    metrics = []
+    for index, name in enumerate(classes):
+        tp = int(matrix[index, index])
+        precision = tp / int(predicted_counts[index]) if predicted_counts[index] else 0.0
+        recall = tp / int(supports[index]) if supports[index] else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        metrics.append((name, precision, recall, f1, int(supports[index]), int(predicted_counts[index])))
+    total = len(actual)
+    macro = [sum(row[i] for row in metrics) / len(classes) for i in (1, 2, 3)]
+    weighted = [sum(row[i] * row[4] for row in metrics) / total for i in (1, 2, 3)]
+    stem = os.path.splitext(weights_path)[0] + "." + subset
+    metrics_path = stem + "_metrics.csv"
+    confusion_path = stem + "_confusion_matrix.csv"
+    with open(metrics_path, "w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["ROW_TYPE", "CLASS_NAME", "PRECISION", "RECALL", "F1", "SUPPORT", "PREDICTED_COUNT"])
+        writer.writerows(("class", *row) for row in metrics)
+        writer.writerow(["summary", "macro_average", *macro, total, total])
+        writer.writerow(["summary", "weighted_average", *weighted, total, total])
+    with open(confusion_path, "w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["ACTUAL_CLASS", *("PREDICTED:" + name for name in classes)])
+        for name, counts in zip(classes, matrix):
+            writer.writerow([name, *map(int, counts)])
+    return {
+        "samples": total,
+        "accuracy_percent": 100 * int(np.trace(matrix)) / total,
+        "macro_f1": macro[2],
+        "weighted_f1": weighted[2],
+        "metrics_csv": os.path.abspath(metrics_path),
+        "confusion_matrix_csv": os.path.abspath(confusion_path),
+        "metric_scale": "0 to 1; undefined precision/recall/F1 set to 0",
+        "confusion_matrix_orientation": "rows actual, columns predicted",
+    }
 
 # 1. Get the exact path to the folder containing this .pyt file ("Classification toolbox")
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -156,6 +204,12 @@ class Classification:
                 parameters[index].setErrorMessage(f"{label} must be at least {minimum}.")
 
     def execute(self, parameters, messages):
+        try:
+            self._execute(parameters, messages)
+        finally:
+            arcpy.ResetProgressor()
+
+    def _execute(self, parameters, messages):
         split_csv = parameters[0].valueAsText
         num_epochs = int(parameters[1].value)
         model_type = parameters[2].valueAsText
@@ -166,6 +220,7 @@ class Classification:
         save_path = parameters[7].valueAsText
         if num_epochs < 1 or patience < 1 or batch_size < 2 or num_points < 20:
             raise ValueError("Use positive epochs/patience, batch size >=2, and points per tree >=20.")
+        arcpy.SetProgressor("default", "Reading split CSV and checking LAS files...")
         splits, file_labels, classes = read_split_csv(split_csv)
         train_size = len(splits["training"])
         test_size = len(splits["validation"])
@@ -279,6 +334,7 @@ class Classification:
 
         ptv3_config = PTv3Config()
 
+        arcpy.SetProgressorLabel(f"Initializing {model_type}...")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         arcpy.AddMessage(f"Using device: {device}")
 
@@ -378,11 +434,32 @@ class Classification:
         # Initialize best loss and patience counter for early stopping
         best_loss = float('inf')
         patience_counter = 0
+        epoch_metrics_path = os.path.splitext(save_path)[0] + ".epoch_metrics.csv"
+        epoch_fields = ["EPOCH", "TRAIN_LOSS", "TRAIN_ACCURACY_PERCENT",
+                        "VALIDATION_LOSS", "VALIDATION_ACCURACY_PERCENT",
+                        "LEARNING_RATE", "NEXT_LEARNING_RATE", "EPOCH_SECONDS",
+                        "TOTAL_SECONDS", "TRAIN_SAMPLES", "VALIDATION_SAMPLES",
+                        "IS_BEST_CHECKPOINT", "EARLY_STOPPED"]
+        with open(epoch_metrics_path, "w", encoding="utf-8-sig", newline="") as stream:
+            csv.writer(stream).writerow(epoch_fields)
+        metadata["training"]["epoch_metrics_csv"] = os.path.abspath(epoch_metrics_path)
+        metadata["training"]["epoch_loss_aggregation"] = "mean of weighted cross-entropy batch losses"
+        arcpy.AddMessage(f"Epoch metrics CSV: {epoch_metrics_path}")
+        training_started = time.perf_counter()
+        batches_per_epoch = len(train_loader) + len(test_loader)
+        total_batches = num_epochs * batches_per_epoch
+        completed_batches = 0
+        arcpy.SetProgressor("step", "Training and validation...", 0, total_batches, 1)
 
         for epoch in range(num_epochs):
+            epoch_started = time.perf_counter()
+            learning_rate = optimizer.param_groups[0]["lr"]
             model.train()
             running_loss = 0.0
+            train_correct, train_total = 0, 0
             for i, (point_clouds, labels) in enumerate(train_loader):
+                arcpy.SetProgressorLabel(
+                    f"Epoch {epoch + 1}/{num_epochs}: training batch {i + 1}/{len(train_loader)}")
                 point_clouds, labels = point_clouds.to(device), labels.to(device)
                 optimizer.zero_grad()
                 outputs = model(point_clouds)
@@ -391,6 +468,10 @@ class Classification:
                 optimizer.step()
                 
                 running_loss += loss.item()
+                train_correct += (outputs.detach().argmax(dim=1) == labels).sum().item()
+                train_total += labels.size(0)
+                completed_batches += 1
+                arcpy.SetProgressorPosition(completed_batches)
             
             arcpy.AddMessage(f"Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss/len(train_loader):.4f}")
 
@@ -398,15 +479,22 @@ class Classification:
             correct = 0
             total = 0
             test_loss = 0
+            validation_actual, validation_predicted = [], []
             with torch.no_grad():
-                for point_clouds, labels in test_loader:
+                for batch_index, (point_clouds, labels) in enumerate(test_loader, start=1):
+                    arcpy.SetProgressorLabel(
+                        f"Epoch {epoch + 1}/{num_epochs}: validation batch {batch_index}/{len(test_loader)}")
                     point_clouds, labels = point_clouds.to(device), labels.to(device)
                     outputs = model(point_clouds)
                     loss = criterion(outputs, labels)
                     test_loss += loss.item()
                     _, predicted = torch.max(outputs.data, 1)
+                    validation_actual.extend(labels.cpu().tolist())
+                    validation_predicted.extend(predicted.cpu().tolist())
                     total += labels.size(0)
                     correct += (predicted == labels).sum().item()
+                    completed_batches += 1
+                    arcpy.SetProgressorPosition(completed_batches)
 
             avg_test_loss = test_loss / len(test_loader)
             accuracy = 100 * correct / total
@@ -418,10 +506,14 @@ class Classification:
             scheduler.step(avg_test_loss)
 
             # Early stopping logic & model saving
-            if avg_test_loss < best_loss:
+            is_best = avg_test_loss < best_loss
+            if is_best:
+                arcpy.SetProgressorLabel(f"Epoch {epoch + 1}/{num_epochs}: saving best checkpoint and validation reports...")
                 best_loss = avg_test_loss
                 patience_counter = 0
                 torch.save(model.state_dict(), save_path)
+                metadata["validation"] = write_evaluation_reports(
+                    save_path, "validation", classes, validation_actual, validation_predicted)
                 metadata["checkpoint"] = {
                     "epoch": epoch + 1,
                     "validation_loss": float(avg_test_loss),
@@ -431,11 +523,22 @@ class Classification:
                 metadata_path = save_model_metadata(save_path, metadata)
                 arcpy.AddMessage(f"Model weights saved to {save_path}")
                 arcpy.AddMessage(f"Model metadata saved to {metadata_path}")
+                arcpy.AddMessage(f"Best validation reports: {metadata['validation']['metrics_csv']} and {metadata['validation']['confusion_matrix_csv']}")
             else:
                 patience_counter += 1
-                if patience_counter >= patience:
-                    arcpy.AddMessage("Early stopping triggered.")
-                    break
+            early_stopped = patience_counter >= patience
+            # Append and close each epoch so completed results survive interruptions.
+            now = time.perf_counter()
+            with open(epoch_metrics_path, "a", encoding="utf-8", newline="") as stream:
+                csv.writer(stream).writerow([
+                    epoch + 1, running_loss / len(train_loader), 100 * train_correct / train_total,
+                    avg_test_loss, accuracy, learning_rate, optimizer.param_groups[0]["lr"],
+                    now - epoch_started, now - training_started, train_total, total,
+                    is_best, early_stopped,
+                ])
+            if early_stopped:
+                arcpy.AddMessage("Early stopping triggered.")
+                break
 
         if splits["testing"]:
             if not np.isfinite(best_loss):
@@ -443,15 +546,24 @@ class Classification:
             model.load_state_dict(torch.load(save_path, map_location=device, weights_only=True))
             model.eval()
             testing_loader = DataLoader(PointCloudDataset(splits["testing"], classes), batch_size=batch_size, shuffle=False)
+            arcpy.SetProgressor("step", "Evaluating held-out testing set...", 0, len(testing_loader), 1)
             testing_correct, testing_total = 0, 0
+            testing_actual, testing_predicted = [], []
             with torch.no_grad():
-                for point_clouds, labels in testing_loader:
+                for batch_index, (point_clouds, labels) in enumerate(testing_loader, start=1):
+                    arcpy.SetProgressorLabel(f"Testing batch {batch_index}/{len(testing_loader)}")
                     predictions = model(point_clouds.to(device)).argmax(dim=1)
+                    testing_actual.extend(labels.tolist())
+                    testing_predicted.extend(predictions.cpu().tolist())
                     testing_correct += (predictions == labels.to(device)).sum().item()
                     testing_total += len(labels)
+                    arcpy.SetProgressorPosition(batch_index)
             testing_accuracy = 100 * testing_correct / testing_total
             arcpy.AddMessage(f"Held-out Testing Accuracy (best checkpoint): {testing_accuracy:.2f}%")
-            metadata["testing"] = {"samples": testing_total, "accuracy_percent": testing_accuracy}
+            arcpy.SetProgressorLabel("Saving testing reports and metadata...")
+            metadata["testing"] = write_evaluation_reports(
+                save_path, "testing", classes, testing_actual, testing_predicted)
+            arcpy.AddMessage(f"Testing reports: {metadata['testing']['metrics_csv']} and {metadata['testing']['confusion_matrix_csv']}")
             save_model_metadata(save_path, metadata)
         return
 
