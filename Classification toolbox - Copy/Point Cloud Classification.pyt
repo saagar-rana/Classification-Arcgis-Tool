@@ -132,6 +132,13 @@ splitter_module = importlib.util.module_from_spec(splitter_spec)
 splitter_spec.loader.exec_module(splitter_module)
 SplitTreeDataset = splitter_module.SplitTreeDataset
 
+prediction_spec = importlib.util.spec_from_file_location(
+    "quebec_tree_prediction", os.path.join(current_dir, "prediction.py"))
+prediction_module = importlib.util.module_from_spec(prediction_spec)
+prediction_spec.loader.exec_module(prediction_module)
+prediction_module.report_writer = write_evaluation_reports
+PredictTreeSpecies = prediction_module.PredictTreeSpecies
+
 # 2. Get the path to the parent folder ("DATASETS")
 parent_dir = os.path.dirname(current_dir)
 
@@ -151,7 +158,7 @@ class Toolbox:
         self.alias = "toolbox"
 
         # List of tool classes associated with this toolbox
-        self.tools = [SplitTreeDataset, Classification]
+        self.tools = [SplitTreeDataset, Classification, PredictTreeSpecies]
 
 
 class Classification:
