@@ -61,6 +61,8 @@ def load_model(weights, metadata_path, project_dir, device):
         model_class = adapter.load_local_model(project_dir, "pointnet", "PointNet")
     elif kind == "PointTransformerV3":
         model_class = adapter.load_local_model(project_dir, "pointtransformerv3", "PointTransformerV3")
+    elif kind == "PointNet++":
+        model_class = adapter.load_pointnet2()
     elif kind == "DGCNN":
         model_class = adapter.load_dgcnn(os.path.join(project_dir, "models"))
     else:

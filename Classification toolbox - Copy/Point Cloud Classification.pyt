@@ -165,7 +165,7 @@ class Classification:
     def __init__(self):
         """Define the tool (tool name is the name of the class)."""
         self.label = "Classify Trees"
-        self.description = "Trains PointNet, Point Transformer V3, or DGCNN to classify individual tree point clouds."
+        self.description = "Trains PointNet, PointNet++, Point Transformer V3, or DGCNN to classify individual tree point clouds."
         self.canRunInBackground = False
 
     def getParameterInfo(self):
@@ -184,7 +184,7 @@ class Classification:
                   for label, name, dtype, required, direction in definitions]
         params[0].filter.list = ["csv"]
         params[1].value = 50
-        params[2].filter.list = ["PointNet", "PointTransformerV3", "DGCNN"]
+        params[2].filter.list = ["PointNet", "PointTransformerV3", "DGCNN", "PointNet++"]
         params[2].value = "PointNet"
         params[3].value = 20
         params[3].filter.type = "Range"
@@ -202,7 +202,7 @@ class Classification:
 
     def updateParameters(self, parameters):
         if not parameters[3].altered:
-            parameters[3].value = 2 if parameters[2].valueAsText == "DGCNN" else 20
+            parameters[3].value = ({"DGCNN": 2, "PointNet++": 4}.get(parameters[2].valueAsText, 20))
 
     def updateMessages(self, parameters):
         for index, minimum, label in ((1, 1, "Epochs"), (3, 2, "Batch size"),
@@ -359,6 +359,10 @@ class Classification:
             PointTransformerV3 = adapter.load_local_model(parent_dir, "pointtransformerv3", "PointTransformerV3")
             model_config = vars(ptv3_config).copy()
             model = PointTransformerV3(config=ptv3_config).to(device)
+        elif model_type == "PointNet++":
+            model = adapter.build_pointnet2(len(classes)).to(device)
+            model_config = vars(model.config).copy()
+            arcpy.AddMessage("PointNet++ SSG: radii 0.5 and 1.5 in input coordinate units; standard PyTorch backend.")
         elif model_type == "DGCNN":
             model = adapter.build_dgcnn(os.path.join(parent_dir, "models"), len(classes)).to(device)
             model_config = vars(model.config).copy()

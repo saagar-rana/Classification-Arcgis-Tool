@@ -79,3 +79,20 @@ def build_dgcnn(models_dir, num_classes):
     config = SimpleNamespace(num_classes=num_classes, channels_input=7,
                              k=20, emb_dims=1024, dropout=0.3)
     return load_dgcnn(models_dir)(config=config)
+
+
+def load_pointnet2():
+    """Load the extension-free PointNet++ SSG implementation on demand."""
+    path = os.path.join(os.path.dirname(__file__), "pointnet2_torch.py")
+    spec = importlib.util.spec_from_file_location("quebec_pointnet2_torch", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.PointNet2SSG
+
+
+def build_pointnet2(num_classes):
+    config = SimpleNamespace(num_classes=num_classes, channels_input=7,
+                             npoint1=512, npoint2=128, radius1=0.5, radius2=1.5,
+                             nsample1=32, nsample2=64, dropout=0.4,
+                             implementation="pytorch_ssg_v1")
+    return load_pointnet2()(config=config)
