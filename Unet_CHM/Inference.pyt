@@ -10,7 +10,6 @@ from rasterio.windows import Window
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import DPTForDepthEstimation
 
 # =========================================================
 # 1. Model Architectures (Must match training definitions)
@@ -76,35 +75,6 @@ class UNetRegressor(nn.Module):
         logits = self.outc(x)
         return self.relu(logits)
 
-class PretrainedDPTRegressor(nn.Module):
-    def __init__(self, pretrained_model_name="Intel/dpt-large", in_channels=4):
-        super(PretrainedDPTRegressor, self).__init__()
-        self.dpt = DPTForDepthEstimation.from_pretrained(pretrained_model_name)
-        if in_channels != 3:
-            old_conv = self.dpt.backbone.embeddings.patch_embeddings.projection
-            new_conv = nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=old_conv.out_channels,
-                kernel_size=old_conv.kernel_size,
-                stride=old_conv.stride,
-                padding=old_conv.padding,
-                bias=(old_conv.bias is not None)
-            )
-            with torch.no_grad():
-                new_conv.weight[:, :3, :, :] = old_conv.weight.clone()
-                new_conv.weight[:, 3:, :, :] = old_conv.weight.mean(dim=1, keepdim=True)
-                if old_conv.bias is not None:
-                    new_conv.bias = old_conv.bias.clone()
-            self.dpt.backbone.embeddings.patch_embeddings.projection = new_conv
-
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        outputs = self.dpt(pixel_values=x)
-        prediction = outputs.predicted_depth.unsqueeze(1)
-        if prediction.shape[2:] != x.shape[2:]:
-            prediction = F.interpolate(prediction, size=x.shape[2:], mode="bilinear", align_corners=False)
-        return self.relu(prediction)
 
 # =========================================================
 # 2. ArcGIS Python Toolbox Definitions
@@ -118,7 +88,7 @@ class Toolbox:
 class PredictCHM:
     def __init__(self):
         self.label = "Predict CHM from Imagery"
-        self.description = "Uses a trained UNet or DPT model to generate a Canopy Height Model from a 4-band raster."
+        self.description = "Uses a trained UNet model to generate a Canopy Height Model from a 4-band raster."
         self.canRunInBackground = False
 
     def getParameterInfo(self):
@@ -145,8 +115,9 @@ class PredictCHM:
             parameterType="Required",
             direction="Input"
         )
-        model_type.filter.list = ["UNet", "DPT (Intel/dpt-large)", "DPT (Intel/dpt-hybrid-midas)"]
+        model_type.filter.list = ["UNet"]
         model_type.value = "UNet"
+        model_type.enabled = False  # Preserve existing parameter positions.
         
         normalization_factor = arcpy.Parameter(
             displayName="Input Normalization Divisor (e.g., 255 or 65535)",
@@ -203,10 +174,8 @@ class PredictCHM:
         try:
             if model_choice == "UNet":
                 model = UNetRegressor(in_channels=4, out_channels=1).to(device)
-            elif "dpt-large" in model_choice:
-                model = PretrainedDPTRegressor(pretrained_model_name="Intel/dpt-large", in_channels=4).to(device)
-            elif "dpt-hybrid" in model_choice:
-                model = PretrainedDPTRegressor(pretrained_model_name="Intel/dpt-hybrid-midas", in_channels=4).to(device)
+            else:
+                raise ValueError("Only UNet is supported by the CHM tools.")
 
             model.load_state_dict(torch.load(model_weights, map_location=device))
             model.eval() # CRITICAL: Set to evaluation mode

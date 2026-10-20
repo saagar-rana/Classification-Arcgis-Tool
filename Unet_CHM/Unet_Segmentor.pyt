@@ -11,7 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from transformers import DPTForDepthEstimation
 
 # =========================================================
 # 1. Custom SSIM & Combined Loss
@@ -173,39 +172,6 @@ class UNetRegressor(nn.Module):
         logits = self.outc(x)
         return self.relu(logits)
 
-class PretrainedDPTRegressor(nn.Module):
-    def __init__(self, pretrained_model_name="Intel/dpt-large", in_channels=4):
-        super(PretrainedDPTRegressor, self).__init__()
-        
-        self.dpt = DPTForDepthEstimation.from_pretrained(pretrained_model_name)
-        
-        if in_channels != 3:
-            old_conv = self.dpt.backbone.embeddings.patch_embeddings.projection
-            new_conv = nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=old_conv.out_channels,
-                kernel_size=old_conv.kernel_size,
-                stride=old_conv.stride,
-                padding=old_conv.padding,
-                bias=(old_conv.bias is not None)
-            )
-            
-            with torch.no_grad():
-                new_conv.weight[:, :3, :, :] = old_conv.weight.clone()
-                new_conv.weight[:, 3:, :, :] = old_conv.weight.mean(dim=1, keepdim=True)
-                if old_conv.bias is not None:
-                    new_conv.bias = old_conv.bias.clone()
-            
-            self.dpt.backbone.embeddings.patch_embeddings.projection = new_conv
-
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        outputs = self.dpt(pixel_values=x)
-        prediction = outputs.predicted_depth.unsqueeze(1)
-        if prediction.shape[2:] != x.shape[2:]:
-            prediction = F.interpolate(prediction, size=x.shape[2:], mode="bilinear", align_corners=False)
-        return self.relu(prediction)
 
 # =========================================================
 # 4. ArcGIS Python Toolbox Definitions
@@ -219,7 +185,7 @@ class Toolbox:
 class TrainCHM:
     def __init__(self):
         self.label = "Train CHM Regressor"
-        self.description = "Trains a UNet or DPT model to predict Canopy Height Models from 4-band imagery."
+        self.description = "Trains a UNet model to predict Canopy Height Models from 4-band imagery."
         self.canRunInBackground = False
 
     def getParameterInfo(self):
@@ -248,8 +214,9 @@ class TrainCHM:
             parameterType="Required",
             direction="Input"
         )
-        model_type.filter.list = ["UNet", "DPT (Intel/dpt-large)", "DPT (Intel/dpt-hybrid-midas)"]
+        model_type.filter.list = ["UNet"]
         model_type.value = "UNet"
+        # model_type.enabled = False  # Preserve existing parameter positions.
 
         # 3. Hyperparameters
         epochs = arcpy.Parameter(
@@ -321,10 +288,8 @@ class TrainCHM:
         # Initialize Model
         if model_choice == "UNet":
             model = UNetRegressor(in_channels=4, out_channels=1).to(device)
-        elif "dpt-large" in model_choice:
-            model = PretrainedDPTRegressor(pretrained_model_name="Intel/dpt-large", in_channels=4).to(device)
-        elif "dpt-hybrid" in model_choice:
-            model = PretrainedDPTRegressor(pretrained_model_name="Intel/dpt-hybrid-midas", in_channels=4).to(device)
+        else:
+            raise ValueError("Only UNet is supported by the CHM tools.")
 
         # Initialize Loss, Optimizer, and Scheduler
         criterion = CombinedCHMLoss(alpha=0.85, data_range=40.0).to(device) 
