@@ -71,15 +71,64 @@ class CombinedCHMLoss(nn.Module):
 # =========================================================
 # 2. PyTorch Dataset 
 # =========================================================
+def validate_tile_pair(image_path, label_path):
+    """Check raster headers before any image/label pair reaches the model."""
+    try:
+        with rasterio.open(image_path) as image, rasterio.open(label_path) as label:
+            problems = []
+            if image.count != 4:
+                problems.append(f"imagery must have exactly 4 bands, found {image.count}")
+            if label.count != 1:
+                problems.append(f"CHM must have exactly 1 band, found {label.count}")
+            if (image.height, image.width) != (label.height, label.width):
+                problems.append(f"dimensions differ: imagery {image.width}x{image.height}, CHM {label.width}x{label.height}")
+            if image.crs is None or label.crs is None:
+                problems.append("both rasters must have a defined CRS; pixel alignment cannot be verified without it")
+            elif image.crs != label.crs:
+                problems.append(f"CRS differs: imagery {image.crs}, CHM {label.crs}")
+            if not (np.isfinite(tuple(image.transform)[:6]).all()
+                    and np.isfinite(tuple(label.transform)[:6]).all()):
+                problems.append("raster transform contains nonfinite values")
+            else:
+                try:
+                    # Compare in pixel units, not map units. This catches even
+                    # subpixel shifts while allowing tiny serialization rounding.
+                    relative = ~image.transform * label.transform
+                    if not np.allclose(tuple(relative)[:6], (1, 0, 0, 0, 1, 0),
+                                       rtol=0, atol=1e-6):
+                        problems.append("pixel grids differ (resolution, origin, rotation, or extent)")
+                    if abs(label.transform.determinant) == 0:
+                        problems.append("CHM raster transform is not invertible")
+                except (ValueError, ZeroDivisionError):
+                    problems.append("imagery raster transform is not invertible")
+            if problems:
+                raise ValueError("; ".join(problems))
+            return image.height, image.width
+    except Exception as exc:
+        raise ValueError(f"Invalid tile pair {os.path.basename(image_path)}: {exc}\nImagery: {image_path}\nCHM: {label_path}") from exc
+
+
 class CHMDataset(Dataset):
-    def __init__(self, image_dir, label_dir):
+    def __init__(self, image_dir, label_dir, progress_callback=None):
         self.image_dir = image_dir
         self.label_dir = label_dir
-        
-        img_files = set(f for f in os.listdir(image_dir) if f.endswith('.tif'))
-        lbl_files = set(f for f in os.listdir(label_dir) if f.endswith('.tif'))
-        self.filenames = list(img_files.intersection(lbl_files))
-        
+        img_files = {f for f in os.listdir(image_dir) if f.lower().endswith('.tif')}
+        lbl_files = {f for f in os.listdir(label_dir) if f.lower().endswith('.tif')}
+        self.filenames = sorted(img_files.intersection(lbl_files))
+        self.unpaired_images = sorted(img_files - lbl_files)
+        self.unpaired_labels = sorted(lbl_files - img_files)
+        expected_shape = None
+        for index, filename in enumerate(self.filenames, start=1):
+            if progress_callback:
+                progress_callback(index, len(self.filenames), filename)
+            shape = validate_tile_pair(os.path.join(image_dir, filename),
+                                       os.path.join(label_dir, filename))
+            if expected_shape is None:
+                expected_shape = shape
+            elif shape != expected_shape:
+                raise ValueError(f"Tile {filename} has dimensions {shape}; other tiles use {expected_shape}. "
+                                 "Use a consistent tile size for batching.")
+
     def __len__(self):
         return len(self.filenames)
 
@@ -267,7 +316,19 @@ class TrainCHM:
         arcpy.AddMessage(f"Starting training on device: {device}")
 
         # Instantiate Dataset
-        full_dataset = CHMDataset(image_dir=image_dir, label_dir=label_dir)
+        def validation_progress(index, total, filename):
+            if index == 1:
+                arcpy.SetProgressor("step", "Checking image/CHM alignment...", 0, total, 1)
+            arcpy.SetProgressorLabel(f"Checking pair {index}/{total}: {filename}")
+            arcpy.SetProgressorPosition(index)
+        try:
+            full_dataset = CHMDataset(image_dir=image_dir, label_dir=label_dir,
+                                      progress_callback=validation_progress)
+        finally:
+            arcpy.ResetProgressor()
+        if full_dataset.unpaired_images or full_dataset.unpaired_labels:
+            arcpy.AddWarning(f"Unpaired TIFF files excluded: {len(full_dataset.unpaired_images)} imagery, "
+                             f"{len(full_dataset.unpaired_labels)} CHM. Pair names must match exactly.")
         arcpy.AddMessage(f"Total valid tile pairs found: {len(full_dataset)}")
 
         if len(full_dataset) == 0:
