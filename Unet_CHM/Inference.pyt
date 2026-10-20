@@ -201,7 +201,7 @@ class PredictCHM:
                 meta.update({
                     "count": 1, 
                     "dtype": rasterio.float32, 
-                    "nodata": 0.0,
+                    "nodata": -9999.0,
                     "compress": "lzw" # Compress output to save space
                 })
 
@@ -227,10 +227,14 @@ class PredictCHM:
                                 window = Window(x, y, patch_size, patch_size)
                                 
                                 # Read patch and normalize (src is still open here!)
-                                patch = src.read(window=window, boundless=True, fill_value=0).astype(np.float32)
-                                patch = patch[:4, :, :] 
+                                masked_patch = src.read(indexes=[1, 2, 3, 4], window=window,
+                                                        boundless=True, masked=True).astype(np.float32)
+                                patch = np.asarray(masked_patch.filled(0), dtype=np.float32)
+                                # Match training: all-four-band zero pixels are padding.
+                                valid_patch = ((~np.ma.getmaskarray(masked_patch) & np.isfinite(patch)).all(axis=0)
+                                               & np.any(patch != 0, axis=0))
+                                patch[:, ~valid_patch] = 0.0
                                 patch = patch / norm_factor
-                                patch = np.nan_to_num(patch, nan=0.0)
 
                                 # Predict
                                 patch_tensor = torch.from_numpy(patch).unsqueeze(0).to(device) 
@@ -252,6 +256,9 @@ class PredictCHM:
                                     crop_x2 = crop_x1 + write_w
                                     
                                     out_patch = pred_np[:, crop_y1:crop_y2, crop_x1:crop_x2]
+                                    valid_output = valid_patch[crop_y1:crop_y2, crop_x1:crop_x2]
+                                    out_patch = np.where(valid_output[None] & np.isfinite(out_patch),
+                                                         out_patch, -9999.0).astype(np.float32)
                                     out_window = Window(write_x, write_y, write_w, write_h)
                                     dst.write(out_patch, window=out_window)
 

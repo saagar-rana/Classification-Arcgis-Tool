@@ -27,43 +27,46 @@ def create_window(window_size, channel=1):
     window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
     return window
 
-def ssim(img1, img2, window_size=11, data_range=1.0):
-    """Calculates the Structural Similarity Index (SSIM) between two images."""
+def ssim(img1, img2, window_size=11, data_range=1.0, valid_mask=None):
+    """SSIM using only valid pixels in each local Gaussian window."""
+    mask = torch.ones_like(img2, dtype=torch.bool) if valid_mask is None else valid_mask.bool()
+    if not mask.any():
+        raise ValueError("No valid CHM pixels in this batch.")
+    img1 = torch.where(mask, img1, torch.zeros_like(img1))
+    img2 = torch.where(mask, img2, torch.zeros_like(img2))
+    weights = mask.to(img1.dtype)
     channel = img1.size(1)
-    
-    window = create_window(window_size, channel).to(img1.device)
-    
-    mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
-    mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
+    window = create_window(window_size, channel).to(device=img1.device, dtype=img1.dtype)
+    def local_sum(value):
+        return F.conv2d(value, window, padding=window_size//2, groups=channel)
+    denominator = local_sum(weights).clamp_min(1e-12)
+    mu1 = local_sum(img1) / denominator
+    mu2 = local_sum(img2) / denominator
+    variance1 = (local_sum(img1.square()) / denominator - mu1.square()).clamp_min(0)
+    variance2 = (local_sum(img2.square()) / denominator - mu2.square()).clamp_min(0)
+    covariance = local_sum(img1 * img2) / denominator - mu1 * mu2
+    c1, c2 = (0.01 * data_range) ** 2, (0.03 * data_range) ** 2
+    score = ((2 * mu1 * mu2 + c1) * (2 * covariance + c2)) / (
+        (mu1.square() + mu2.square() + c1) * (variance1 + variance2 + c2))
+    return score[mask].mean()
 
-    mu1_sq = mu1.pow(2)
-    mu2_sq = mu2.pow(2)
-    mu1_mu2 = mu1 * mu2
-
-    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size//2, groups=channel) - mu1_sq
-    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size//2, groups=channel) - mu2_sq
-    sigma12 = F.conv2d(img1 * img2, window, padding=window_size//2, groups=channel) - mu1_mu2
-
-    C1 = (0.01 * data_range) ** 2
-    C2 = (0.03 * data_range) ** 2
-
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-    return ssim_map.mean()
 
 class CombinedCHMLoss(nn.Module):
     def __init__(self, alpha=0.85, data_range=40.0, window_size=11):
-        super(CombinedCHMLoss, self).__init__()
+        super().__init__()
         self.alpha = alpha
         self.data_range = data_range
         self.window_size = window_size
-        self.smooth_l1 = nn.SmoothL1Loss()
 
-    def forward(self, y_pred, y_true):
-        l1_loss = self.smooth_l1(y_pred, y_true)
-        ssim_val = ssim(y_pred, y_true, self.window_size, self.data_range)
-        ssim_loss = 1.0 - ssim_val
-        combined_loss = (self.alpha * l1_loss) + ((1.0 - self.alpha) * ssim_loss)
-        return combined_loss
+    def forward(self, y_pred, y_true, valid_mask=None):
+        mask = torch.isfinite(y_true) if valid_mask is None else valid_mask.bool() & torch.isfinite(y_true)
+        if not mask.any():
+            raise ValueError("No valid CHM pixels in this batch.")
+        if not torch.isfinite(y_pred[mask]).all():
+            raise ValueError("Model produced nonfinite heights at valid pixels.")
+        l1_loss = F.smooth_l1_loss(y_pred[mask], y_true[mask])
+        ssim_value = ssim(y_pred, y_true, self.window_size, self.data_range, mask)
+        return self.alpha * l1_loss + (1.0 - self.alpha) * (1.0 - ssim_value)
 
 # =========================================================
 # 2. PyTorch Dataset 
@@ -85,28 +88,23 @@ class CHMDataset(Dataset):
         img_path = os.path.join(self.image_dir, file_name)
         lbl_path = os.path.join(self.label_dir, file_name)
 
-        # Read 4-Band Input Image
         with rasterio.open(img_path) as src:
-            image = src.read().astype(np.float32)
-            image = image / 255.0  
+            masked_image = src.read(masked=True).astype(np.float32)
+        image = np.asarray(masked_image.filled(0), dtype=np.float32)
+        # ArcGIS-exported padding has ordinary zeros in every imagery band.
+        # Do not infer missing coverage from zero CHM heights.
+        image_valid = ((~np.ma.getmaskarray(masked_image) & np.isfinite(image)).all(axis=0)
+                       & np.any(image != 0, axis=0))
+        image[:, ~image_valid] = 0.0
+        image /= 255.0
 
-        # Read 1-Band CHM Target
         with rasterio.open(lbl_path) as src:
-            nodata_val = src.nodata
-            label = src.read(1).astype(np.float32)
-            
-            if nodata_val is not None:
-                label[label == nodata_val] = 0.0
-                label[label < 0] = 0.0
-                label = np.nan_to_num(label, nan=0.0)
-                
-            label = np.expand_dims(label, axis=0)
-
-        image = np.nan_to_num(image, nan=0.0)
-        label = np.where(label < 0, 0.0, label)
-        label = np.nan_to_num(label, nan=0.0)
-
-        return torch.from_numpy(image), torch.from_numpy(label)
+            masked_label = src.read(1, masked=True).astype(np.float32)
+        label = np.asarray(masked_label.filled(0), dtype=np.float32)
+        valid = image_valid & ~np.ma.getmaskarray(masked_label) & np.isfinite(label)
+        label = np.where(valid, np.maximum(label, 0.0), 0.0).astype(np.float32)
+        return (torch.from_numpy(image), torch.from_numpy(label[None]),
+                torch.from_numpy(valid[None]))
 
 # =========================================================
 # 3. Model Architectures
@@ -302,31 +300,47 @@ class TrainCHM:
         for epoch in range(num_epochs):
             model.train() 
             train_loss = 0.0
+            train_valid_pixels = 0
             
-            for batch_idx, (images, labels) in enumerate(train_loader):
+            for batch_idx, (images, labels, valid_mask) in enumerate(train_loader):
                 images, labels = images.to(device), labels.to(device)
+                valid_mask = valid_mask.to(device)
+                valid_count = int(valid_mask.sum().item())
+                if not valid_count:
+                    continue
                 
                 optimizer.zero_grad()
                 predictions = model(images)
-                loss = criterion(predictions, labels)
+                loss = criterion(predictions, labels, valid_mask)
                 loss.backward()
                 optimizer.step()
                 
-                train_loss += loss.item()
+                train_loss += loss.item() * valid_count
+                train_valid_pixels += valid_count
                 
-            avg_train_loss = train_loss / len(train_loader)
+            if not train_valid_pixels:
+                raise ValueError("Training partition contains no valid CHM pixels.")
+            avg_train_loss = train_loss / train_valid_pixels
             
             model.eval() 
             val_loss = 0.0
+            val_valid_pixels = 0
             
             with torch.no_grad(): 
-                for images, labels in val_loader:
+                for images, labels, valid_mask in val_loader:
                     images, labels = images.to(device), labels.to(device)
+                    valid_mask = valid_mask.to(device)
+                    valid_count = int(valid_mask.sum().item())
+                    if not valid_count:
+                        continue
                     predictions = model(images)
-                    loss = criterion(predictions, labels)
-                    val_loss += loss.item()
+                    loss = criterion(predictions, labels, valid_mask)
+                    val_loss += loss.item() * valid_count
+                    val_valid_pixels += valid_count
                     
-            avg_val_loss = val_loss / len(val_loader)
+            if not val_valid_pixels:
+                raise ValueError("Validation partition contains no valid CHM pixels.")
+            avg_val_loss = val_loss / val_valid_pixels
             scheduler.step(avg_val_loss)
             
             # Logging
