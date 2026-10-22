@@ -42,19 +42,80 @@ def save_chm_metadata(weights_path, epoch, validation_loss, batch_size):
         },
     }
     destination = os.path.splitext(weights_path)[0] + ".metadata.json"
+    write_chm_json(destination, metadata)
+    return destination
+
+
+def write_chm_json(destination, payload):
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
                                          dir=os.path.dirname(os.path.abspath(destination)),
-                                         prefix=".chm_metadata_", suffix=".tmp", delete=False) as stream:
+                                         prefix=".chm_report_", suffix=".tmp", delete=False) as stream:
             temporary = stream.name
-            json.dump(metadata, stream, indent=2, allow_nan=False)
+            json.dump(payload, stream, indent=2, allow_nan=False)
         os.replace(temporary, destination)
         temporary = None
     finally:
         if temporary and os.path.isfile(temporary):
             os.remove(temporary)
-    return destination
+
+
+def check_test_separation(training_dataset, test_dataset):
+    """Reject files reused from training/validation, including hard links."""
+    def keys(dataset):
+        result = set()
+        for folder in (dataset.image_dir, dataset.label_dir):
+            for filename in dataset.filenames:
+                path = os.path.join(folder, filename)
+                result.add(("path", os.path.normcase(os.path.realpath(path))))
+                stat = os.stat(path)
+                if stat.st_ino:
+                    result.add(("file", stat.st_dev, stat.st_ino))
+        return result
+    if keys(training_dataset).intersection(keys(test_dataset)):
+        raise ValueError("Testing files must be separate from the imagery/CHM files used for training and validation.")
+
+
+def evaluate_chm_test(model, dataset, batch_size, device):
+    """Evaluate once; aggregate height errors over valid pixels, not batches."""
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    absolute_error = squared_error = signed_error = 0.0
+    valid_pixels = evaluated_tiles = 0
+    model.eval()
+    arcpy.SetProgressor("step", "Evaluating optional test dataset...", 0, len(loader), 1)
+    try:
+        with torch.inference_mode():
+            for index, (images, labels, valid_mask) in enumerate(loader, start=1):
+                arcpy.SetProgressorLabel(f"Testing batch {index}/{len(loader)}")
+                mask = valid_mask.to(device).bool()
+                count = int(mask.sum().item())
+                if count:
+                    predictions = model(images.to(device))
+                    labels = labels.to(device)
+                    if predictions.shape != labels.shape:
+                        raise ValueError("Test predictions and CHM labels have different dimensions.")
+                    if not torch.isfinite(predictions[mask]).all():
+                        raise ValueError("Nonfinite model predictions at valid testing pixels.")
+                    errors = predictions[mask].double() - labels[mask].double()
+                    absolute_error += errors.abs().sum().item()
+                    squared_error += errors.square().sum().item()
+                    signed_error += errors.sum().item()
+                    valid_pixels += count
+                    evaluated_tiles += int(valid_mask.flatten(1).any(1).sum().item())
+                arcpy.SetProgressorPosition(index)
+    finally:
+        arcpy.ResetProgressor()
+    if not valid_pixels:
+        raise ValueError("Testing dataset contains no valid CHM pixels; no test metrics were written.")
+    return {
+        "tile_pairs": len(dataset), "evaluated_tiles": evaluated_tiles,
+        "empty_tiles_skipped": len(dataset) - evaluated_tiles,
+        "valid_pixels": valid_pixels, "mae": absolute_error / valid_pixels,
+        "rmse": math.sqrt(squared_error / valid_pixels),
+        "bias_predicted_minus_observed": signed_error / valid_pixels,
+        "height_units": "source CHM units", "aggregation": "all valid tile pixels; overlapping pixels counted per tile",
+    }
 
 
 # =========================================================
@@ -116,45 +177,8 @@ class CombinedCHMLoss(nn.Module):
 # =========================================================
 # 2. PyTorch Dataset 
 # =========================================================
-def validate_tile_pair(image_path, label_path):
-    """Check raster headers before any image/label pair reaches the model."""
-    try:
-        with rasterio.open(image_path) as image, rasterio.open(label_path) as label:
-            problems = []
-            if image.count != 4:
-                problems.append(f"imagery must have exactly 4 bands, found {image.count}")
-            if label.count != 1:
-                problems.append(f"CHM must have exactly 1 band, found {label.count}")
-            if (image.height, image.width) != (label.height, label.width):
-                problems.append(f"dimensions differ: imagery {image.width}x{image.height}, CHM {label.width}x{label.height}")
-            if image.crs is None or label.crs is None:
-                problems.append("both rasters must have a defined CRS; pixel alignment cannot be verified without it")
-            elif image.crs != label.crs:
-                problems.append(f"CRS differs: imagery {image.crs}, CHM {label.crs}")
-            if not (np.isfinite(tuple(image.transform)[:6]).all()
-                    and np.isfinite(tuple(label.transform)[:6]).all()):
-                problems.append("raster transform contains nonfinite values")
-            else:
-                try:
-                    # Compare in pixel units, not map units. This catches even
-                    # subpixel shifts while allowing tiny serialization rounding.
-                    relative = ~image.transform * label.transform
-                    if not np.allclose(tuple(relative)[:6], (1, 0, 0, 0, 1, 0),
-                                       rtol=0, atol=1e-6):
-                        problems.append("pixel grids differ (resolution, origin, rotation, or extent)")
-                    if abs(label.transform.determinant) == 0:
-                        problems.append("CHM raster transform is not invertible")
-                except (ValueError, ZeroDivisionError):
-                    problems.append("imagery raster transform is not invertible")
-            if problems:
-                raise ValueError("; ".join(problems))
-            return image.height, image.width
-    except Exception as exc:
-        raise ValueError(f"Invalid tile pair {os.path.basename(image_path)}: {exc}\nImagery: {image_path}\nCHM: {label_path}") from exc
-
-
 class CHMDataset(Dataset):
-    def __init__(self, image_dir, label_dir, progress_callback=None):
+    def __init__(self, image_dir, label_dir):
         self.image_dir = image_dir
         self.label_dir = label_dir
         img_files = {f for f in os.listdir(image_dir) if f.lower().endswith('.tif')}
@@ -162,17 +186,6 @@ class CHMDataset(Dataset):
         self.filenames = sorted(img_files.intersection(lbl_files))
         self.unpaired_images = sorted(img_files - lbl_files)
         self.unpaired_labels = sorted(lbl_files - img_files)
-        expected_shape = None
-        for index, filename in enumerate(self.filenames, start=1):
-            if progress_callback:
-                progress_callback(index, len(self.filenames), filename)
-            shape = validate_tile_pair(os.path.join(image_dir, filename),
-                                       os.path.join(label_dir, filename))
-            if expected_shape is None:
-                expected_shape = shape
-            elif shape != expected_shape:
-                raise ValueError(f"Tile {filename} has dimensions {shape}; other tiles use {expected_shape}. "
-                                 "Use a consistent tile size for batching.")
 
     def __len__(self):
         return len(self.filenames)
@@ -338,7 +351,13 @@ class TrainCHM:
             direction="Output"
         )
 
-        return [img_dir, lbl_dir, model_type, epochs, batch_size, out_pth]
+        test_img_dir = arcpy.Parameter(
+            displayName="Test Images Directory (Optional, 4-Band .tif)", name="test_img_dir",
+            datatype="DEFolder", parameterType="Optional", direction="Input")
+        test_lbl_dir = arcpy.Parameter(
+            displayName="Test Labels Directory (Optional, 1-Band CHM .tif)", name="test_lbl_dir",
+            datatype="DEFolder", parameterType="Optional", direction="Input")
+        return [img_dir, lbl_dir, model_type, epochs, batch_size, out_pth, test_img_dir, test_lbl_dir]
 
     def isLicensed(self):
         return True
@@ -347,7 +366,9 @@ class TrainCHM:
         return
 
     def updateMessages(self, parameters):
-        return
+        if bool(parameters[6].valueAsText) != bool(parameters[7].valueAsText):
+            parameters[6 if not parameters[6].valueAsText else 7].setErrorMessage(
+                "Provide both test imagery and test CHM directories, or leave both empty.")
 
     def execute(self, parameters, messages):
         image_dir = parameters[0].valueAsText
@@ -356,21 +377,16 @@ class TrainCHM:
         num_epochs = parameters[3].value
         batch_size = parameters[4].value
         save_path = parameters[5].valueAsText
+        test_image_dir = parameters[6].valueAsText if len(parameters) > 6 else None
+        test_label_dir = parameters[7].valueAsText if len(parameters) > 7 else None
+        if bool(test_image_dir) != bool(test_label_dir):
+            raise ValueError("Provide both test imagery and test CHM directories, or leave both empty.")
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         arcpy.AddMessage(f"Starting training on device: {device}")
 
-        # Instantiate Dataset
-        def validation_progress(index, total, filename):
-            if index == 1:
-                arcpy.SetProgressor("step", "Checking image/CHM alignment...", 0, total, 1)
-            arcpy.SetProgressorLabel(f"Checking pair {index}/{total}: {filename}")
-            arcpy.SetProgressorPosition(index)
-        try:
-            full_dataset = CHMDataset(image_dir=image_dir, label_dir=label_dir,
-                                      progress_callback=validation_progress)
-        finally:
-            arcpy.ResetProgressor()
+        # Pair imagery and CHM files by filename without header/alignment checks.
+        full_dataset = CHMDataset(image_dir=image_dir, label_dir=label_dir)
         if full_dataset.unpaired_images or full_dataset.unpaired_labels:
             arcpy.AddWarning(f"Unpaired TIFF files excluded: {len(full_dataset.unpaired_images)} imagery, "
                              f"{len(full_dataset.unpaired_labels)} CHM. Pair names must match exactly.")
@@ -379,6 +395,20 @@ class TrainCHM:
         if len(full_dataset) == 0:
             arcpy.AddError("No matching .tif files found between image and label directories.")
             return
+
+        test_dataset = None
+        if test_image_dir:
+            arcpy.AddMessage("Loading optional testing image/CHM pairs...")
+            test_dataset = CHMDataset(test_image_dir, test_label_dir)
+            if not len(test_dataset):
+                raise ValueError("No matching TIFF pairs found in the testing directories.")
+            if test_dataset.unpaired_images or test_dataset.unpaired_labels:
+                arcpy.AddWarning(f"Unpaired testing files excluded: {len(test_dataset.unpaired_images)} imagery, "
+                                 f"{len(test_dataset.unpaired_labels)} CHM.")
+            check_test_separation(full_dataset, test_dataset)
+            arcpy.AddMessage(f"Optional testing dataset: {len(test_dataset)} tile pairs; evaluated only after training.")
+            arcpy.AddWarning("Use separate source areas for independent testing. Different files may still contain "
+                             "overlapping imagery or repeated observations of the same location.")
 
         # Split Data
         train_size = int(0.8 * len(full_dataset))
@@ -461,6 +491,28 @@ class TrainCHM:
                 arcpy.AddMessage(f"Model metadata saved to {metadata_path}")
                 arcpy.AddMessage(f"  --> Best model saved to {save_path} (Val Loss improved to {best_val_loss:.4f})")
 
+        if test_dataset is not None:
+            if not math.isfinite(best_val_loss):
+                raise ValueError("No valid best checkpoint was saved; testing cannot proceed.")
+            arcpy.AddMessage("Loading the best validation checkpoint for testing...")
+            model.load_state_dict(torch.load(save_path, map_location=device, weights_only=True))
+            metrics = evaluate_chm_test(model, test_dataset, batch_size, device)
+            metadata_path = os.path.splitext(save_path)[0] + ".metadata.json"
+            with open(metadata_path, encoding="utf-8") as stream:
+                metadata = json.load(stream)
+            report_path = os.path.splitext(save_path)[0] + ".test_metrics.json"
+            metrics.update({"checkpoint_epoch": metadata["checkpoint"]["epoch"],
+                            "model_weights": os.path.abspath(save_path),
+                            "image_directory": os.path.abspath(test_image_dir),
+                            "label_directory": os.path.abspath(test_label_dir),
+                            "metrics_file": os.path.abspath(report_path)})
+            write_chm_json(report_path, metrics)
+            metadata["testing"] = metrics
+            write_chm_json(metadata_path, metadata)
+            arcpy.AddMessage(f"Testing (best checkpoint): MAE {metrics['mae']:.4f}, "
+                             f"RMSE {metrics['rmse']:.4f}, bias {metrics['bias_predicted_minus_observed']:.4f} "
+                             f"in source CHM units; {metrics['valid_pixels']} valid pixels.")
+            arcpy.AddMessage(f"Testing metrics saved to {report_path}")
         arcpy.AddMessage("Training complete!")
         return
 
