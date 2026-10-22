@@ -3,6 +3,9 @@
 import arcpy
 import os
 import math
+import json
+import tempfile
+from datetime import datetime, timezone
 import numpy as np
 import rasterio
 
@@ -11,6 +14,48 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+
+INPUT_NORMALIZATION_DIVISOR = 255.0
+
+
+def save_chm_metadata(weights_path, epoch, validation_loss, batch_size):
+    """Record the fixed preprocessing beside each best U-Net checkpoint."""
+    metadata = {
+        "schema_version": 1,
+        "task": "chm_regression",
+        "model_type": "UNet",
+        "weights_file": os.path.basename(weights_path),
+        "input_channels": 4,
+        "output_channels": 1,
+        "preprocessing": {
+            "band_indices": [1, 2, 3, 4],
+            "normalization_divisor": INPUT_NORMALIZATION_DIVISOR,
+            "all_zero_imagery_is_padding": True,
+            "target_scaling": "none; source CHM height units",
+            "output_nodata": -9999.0,
+        },
+        "training": {"batch_size": int(batch_size)},
+        "checkpoint": {
+            "epoch": int(epoch),
+            "validation_loss": float(validation_loss),
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+    destination = os.path.splitext(weights_path)[0] + ".metadata.json"
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                         dir=os.path.dirname(os.path.abspath(destination)),
+                                         prefix=".chm_metadata_", suffix=".tmp", delete=False) as stream:
+            temporary = stream.name
+            json.dump(metadata, stream, indent=2, allow_nan=False)
+        os.replace(temporary, destination)
+        temporary = None
+    finally:
+        if temporary and os.path.isfile(temporary):
+            os.remove(temporary)
+    return destination
+
 
 # =========================================================
 # 1. Custom SSIM & Combined Loss
@@ -145,7 +190,7 @@ class CHMDataset(Dataset):
         image_valid = ((~np.ma.getmaskarray(masked_image) & np.isfinite(image)).all(axis=0)
                        & np.any(image != 0, axis=0))
         image[:, ~image_valid] = 0.0
-        image /= 255.0
+        image /= INPUT_NORMALIZATION_DIVISOR
 
         with rasterio.open(lbl_path) as src:
             masked_label = src.read(1, masked=True).astype(np.float32)
@@ -412,6 +457,8 @@ class TrainCHM:
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 torch.save(model.state_dict(), save_path)
+                metadata_path = save_chm_metadata(save_path, epoch + 1, best_val_loss, batch_size)
+                arcpy.AddMessage(f"Model metadata saved to {metadata_path}")
                 arcpy.AddMessage(f"  --> Best model saved to {save_path} (Val Loss improved to {best_val_loss:.4f})")
 
         arcpy.AddMessage("Training complete!")

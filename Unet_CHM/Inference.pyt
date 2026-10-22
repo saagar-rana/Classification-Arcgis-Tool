@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+INPUT_NORMALIZATION_DIVISOR = 255.0
+
 # =========================================================
 # 1. Model Architectures (Must match training definitions)
 # =========================================================
@@ -162,13 +164,14 @@ class PredictCHM:
         model_type.enabled = False  # Preserve existing parameter positions.
         
         normalization_factor = arcpy.Parameter(
-            displayName="Input Normalization Divisor (e.g., 255 or 65535)",
+            displayName="Input Normalization Divisor (Fixed at 255)",
             name="normalization_factor",
             datatype="GPDouble",
             parameterType="Required",
             direction="Input"
         )
-        normalization_factor.value = 255.0
+        normalization_factor.value = INPUT_NORMALIZATION_DIVISOR
+        normalization_factor.enabled = False
 
         out_raster = arcpy.Parameter(
             displayName="Output Predicted CHM (TIFF or File Geodatabase Raster)",
@@ -184,7 +187,8 @@ class PredictCHM:
         return True
 
     def updateParameters(self, parameters):
-        return
+        parameters[3].value = INPUT_NORMALIZATION_DIVISOR
+        parameters[3].enabled = False
 
     def updateMessages(self, parameters):
         return
@@ -199,7 +203,7 @@ class PredictCHM:
         raw_in_raster = parameters[0].valueAsText
         model_weights = parameters[1].valueAsText
         model_choice = parameters[2].valueAsText
-        norm_factor = parameters[3].value
+        norm_factor = INPUT_NORMALIZATION_DIVISOR
         raw_out_raster = parameters[4].valueAsText
         in_raster = arcpy.Describe(raw_in_raster).catalogPath
         if not raw_out_raster:
