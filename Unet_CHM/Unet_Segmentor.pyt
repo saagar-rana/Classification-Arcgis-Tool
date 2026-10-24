@@ -4,8 +4,6 @@ import arcpy
 import os
 import math
 import json
-import csv
-import time
 import tempfile
 from datetime import datetime, timezone
 import numpy as np
@@ -36,11 +34,7 @@ def save_chm_metadata(weights_path, epoch, validation_loss, batch_size):
             "target_scaling": "none; source CHM height units",
             "output_nodata": -9999.0,
         },
-        "training": {
-            "batch_size": int(batch_size),
-            "epoch_metrics_csv": os.path.abspath(os.path.splitext(weights_path)[0] + ".epoch_metrics.csv"),
-            "metric_aggregation": "valid pixels; source CHM height units; training metrics during updates, validation in eval mode",
-        },
+        "training": {"batch_size": int(batch_size)},
         "checkpoint": {
             "epoch": int(epoch),
             "validation_loss": float(validation_loss),
@@ -65,13 +59,6 @@ def write_chm_json(destination, payload):
     finally:
         if temporary and os.path.isfile(temporary):
             os.remove(temporary)
-
-
-def masked_height_error_sums(predictions, labels, valid_mask):
-    """Return sums for pixel-weighted MAE, RMSE, and signed bias."""
-    with torch.no_grad():
-        errors = predictions.detach()[valid_mask].double() - labels[valid_mask].double()
-        return errors.abs().sum().item(), errors.square().sum().item(), errors.sum().item()
 
 
 def check_test_separation(training_dataset, test_dataset):
@@ -420,7 +407,9 @@ class TrainCHM:
                                  f"{len(test_dataset.unpaired_labels)} CHM.")
             check_test_separation(full_dataset, test_dataset)
             arcpy.AddMessage(f"Optional testing dataset: {len(test_dataset)} tile pairs; evaluated only after training.")
-            
+            arcpy.AddWarning("Use separate source areas for independent testing. Different files may still contain "
+                             "overlapping imagery or repeated observations of the same location.")
+
         # Split Data
         train_size = int(0.8 * len(full_dataset))
         val_size = len(full_dataset) - train_size
@@ -443,24 +432,11 @@ class TrainCHM:
 
         best_val_loss = float('inf')
 
-        epoch_metrics_path = os.path.splitext(save_path)[0] + ".epoch_metrics.csv"
-        epoch_fields = ["EPOCH", "TRAIN_LOSS", "VALIDATION_LOSS", "TRAIN_MAE", "TRAIN_RMSE",
-                        "TRAIN_BIAS", "VALIDATION_MAE", "VALIDATION_RMSE", "VALIDATION_BIAS",
-                        "LEARNING_RATE", "NEXT_LEARNING_RATE", "EPOCH_SECONDS", "TOTAL_SECONDS",
-                        "TRAIN_TILE_PAIRS", "VALIDATION_TILE_PAIRS", "TRAIN_VALID_PIXELS",
-                        "VALIDATION_VALID_PIXELS", "IS_BEST_CHECKPOINT"]
-        with open(epoch_metrics_path, "w", encoding="utf-8-sig", newline="") as stream:
-            csv.writer(stream).writerow(epoch_fields)
-        arcpy.AddMessage(f"Epoch metrics CSV: {epoch_metrics_path}")
-        training_started = time.perf_counter()
         # Training Loop
         for epoch in range(num_epochs):
-            epoch_started = time.perf_counter()
-            learning_rate = optimizer.param_groups[0]["lr"]
             model.train() 
             train_loss = 0.0
             train_valid_pixels = 0
-            train_absolute = train_squared = train_signed = 0.0
             
             for batch_idx, (images, labels, valid_mask) in enumerate(train_loader):
                 images, labels = images.to(device), labels.to(device)
@@ -477,10 +453,6 @@ class TrainCHM:
                 
                 train_loss += loss.item() * valid_count
                 train_valid_pixels += valid_count
-                absolute, squared, signed = masked_height_error_sums(predictions, labels, valid_mask)
-                train_absolute += absolute
-                train_squared += squared
-                train_signed += signed
                 
             if not train_valid_pixels:
                 raise ValueError("Training partition contains no valid CHM pixels.")
@@ -489,7 +461,6 @@ class TrainCHM:
             model.eval() 
             val_loss = 0.0
             val_valid_pixels = 0
-            val_absolute = val_squared = val_signed = 0.0
             
             with torch.no_grad(): 
                 for images, labels, valid_mask in val_loader:
@@ -502,10 +473,6 @@ class TrainCHM:
                     loss = criterion(predictions, labels, valid_mask)
                     val_loss += loss.item() * valid_count
                     val_valid_pixels += valid_count
-                    absolute, squared, signed = masked_height_error_sums(predictions, labels, valid_mask)
-                    val_absolute += absolute
-                    val_squared += squared
-                    val_signed += signed
                     
             if not val_valid_pixels:
                 raise ValueError("Validation partition contains no valid CHM pixels.")
@@ -517,26 +484,12 @@ class TrainCHM:
             arcpy.AddMessage(log_msg)
             
             # Checkpointing
-            is_best_checkpoint = avg_val_loss < best_val_loss
-            if is_best_checkpoint:
+            if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 torch.save(model.state_dict(), save_path)
                 metadata_path = save_chm_metadata(save_path, epoch + 1, best_val_loss, batch_size)
                 arcpy.AddMessage(f"Model metadata saved to {metadata_path}")
                 arcpy.AddMessage(f"  --> Best model saved to {save_path} (Val Loss improved to {best_val_loss:.4f})")
-
-            # Close the file after every epoch so completed rows survive a later failure.
-            now = time.perf_counter()
-            with open(epoch_metrics_path, "a", encoding="utf-8", newline="") as stream:
-                csv.writer(stream).writerow([
-                    epoch + 1, avg_train_loss, avg_val_loss,
-                    train_absolute / train_valid_pixels, math.sqrt(train_squared / train_valid_pixels),
-                    train_signed / train_valid_pixels, val_absolute / val_valid_pixels,
-                    math.sqrt(val_squared / val_valid_pixels), val_signed / val_valid_pixels,
-                    learning_rate, optimizer.param_groups[0]["lr"], now - epoch_started,
-                    now - training_started, len(train_dataset), len(val_dataset),
-                    train_valid_pixels, val_valid_pixels, is_best_checkpoint,
-                ])
 
         if test_dataset is not None:
             if not math.isfinite(best_val_loss):
