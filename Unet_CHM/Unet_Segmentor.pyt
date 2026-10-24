@@ -4,6 +4,8 @@ import arcpy
 import os
 import math
 import json
+import csv
+import time
 import tempfile
 from datetime import datetime, timezone
 import numpy as np
@@ -18,7 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 INPUT_NORMALIZATION_DIVISOR = 255.0
 
 
-def save_chm_metadata(weights_path, epoch, validation_loss, batch_size):
+def save_chm_metadata(weights_path, epoch, validation_loss, batch_size, pretrained_model=None):
     """Record the fixed preprocessing beside each best U-Net checkpoint."""
     metadata = {
         "schema_version": 1,
@@ -34,7 +36,14 @@ def save_chm_metadata(weights_path, epoch, validation_loss, batch_size):
             "target_scaling": "none; source CHM height units",
             "output_nodata": -9999.0,
         },
-        "training": {"batch_size": int(batch_size)},
+        "training": {
+            "batch_size": int(batch_size),
+            "initial_weights": os.path.abspath(pretrained_model) if pretrained_model else None,
+            "initialization": "pretrained" if pretrained_model else "random",
+            "optimizer_restored": False,
+            "epoch_metrics_csv": os.path.abspath(os.path.splitext(weights_path)[0] + ".epoch_metrics.csv"),
+            "metric_aggregation": "valid pixels; source CHM height units; training metrics during updates, validation in eval mode",
+        },
         "checkpoint": {
             "epoch": int(epoch),
             "validation_loss": float(validation_loss),
@@ -59,6 +68,58 @@ def write_chm_json(destination, payload):
     finally:
         if temporary and os.path.isfile(temporary):
             os.remove(temporary)
+
+
+def validate_pretrained_chm_path(pretrained_path, output_path):
+    if not pretrained_path:
+        return
+    if not os.path.isfile(pretrained_path) or not pretrained_path.lower().endswith(".pth"):
+        raise ValueError("Choose an existing pretrained .pth file.")
+    if output_path:
+        same = os.path.normcase(os.path.realpath(pretrained_path)) == os.path.normcase(os.path.realpath(output_path))
+        if not same and os.path.exists(output_path):
+            same = os.path.samefile(pretrained_path, output_path)
+        if same:
+            raise ValueError("Choose a different output .pth path so the pretrained weights are preserved.")
+
+
+def load_pretrained_chm(model, pretrained_path):
+    """Load complete compatible U-Net weights; do not silently skip layers."""
+    metadata_path = os.path.splitext(pretrained_path)[0] + ".metadata.json"
+    if os.path.isfile(metadata_path):
+        with open(metadata_path, encoding="utf-8-sig") as stream:
+            metadata = json.load(stream)
+        if (metadata.get("model_type") != "UNet" or metadata.get("input_channels") != 4
+                or metadata.get("output_channels") != 1):
+            raise ValueError("Pretrained metadata must describe a four-band, one-output CHM U-Net.")
+        if metadata.get("preprocessing", {}).get("normalization_divisor") != INPUT_NORMALIZATION_DIVISOR:
+            raise ValueError("Pretrained model metadata must use the fixed normalization divisor of 255.")
+    checkpoint = torch.load(pretrained_path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Pretrained .pth must contain a PyTorch state dictionary.")
+    state = checkpoint.get("state_dict", checkpoint.get("model_state_dict", checkpoint))
+    if not isinstance(state, dict) or not state:
+        raise ValueError("Pretrained checkpoint has no model state dictionary.")
+    cleaned = {}
+    for key, value in state.items():
+        if not isinstance(key, str) or not isinstance(value, torch.Tensor):
+            raise ValueError("Pretrained state dictionary must map tensor names to tensors.")
+        name = key.removeprefix("module.")
+        if name in cleaned:
+            raise ValueError(f"Duplicate pretrained tensor name: {name}")
+        cleaned[name] = value
+    expected = model.state_dict()
+    if set(cleaned) != set(expected) or any(cleaned[name].shape != expected[name].shape for name in expected if name in cleaned):
+        raise ValueError("Pretrained weights do not match this four-band CHM U-Net architecture. All tensor names and shapes must match.")
+    model.load_state_dict(cleaned, strict=True)
+    return len(cleaned)
+
+
+def masked_height_error_sums(predictions, labels, valid_mask):
+    """Return sums for pixel-weighted MAE, RMSE, and signed bias."""
+    with torch.no_grad():
+        errors = predictions.detach()[valid_mask].double() - labels[valid_mask].double()
+        return errors.abs().sum().item(), errors.square().sum().item(), errors.sum().item()
 
 
 def check_test_separation(training_dataset, test_dataset):
@@ -357,7 +418,11 @@ class TrainCHM:
         test_lbl_dir = arcpy.Parameter(
             displayName="Test Labels Directory (Optional, 1-Band CHM .tif)", name="test_lbl_dir",
             datatype="DEFolder", parameterType="Optional", direction="Input")
-        return [img_dir, lbl_dir, model_type, epochs, batch_size, out_pth, test_img_dir, test_lbl_dir]
+        pretrained_model = arcpy.Parameter(
+            displayName="Pretrained Model Weights (.pth, Optional)", name="pretrained_model",
+            datatype="DEFile", parameterType="Optional", direction="Input")
+        pretrained_model.filter.list = ["pth"]
+        return [img_dir, lbl_dir, model_type, epochs, batch_size, out_pth, test_img_dir, test_lbl_dir, pretrained_model]
 
     def isLicensed(self):
         return True
@@ -369,14 +434,28 @@ class TrainCHM:
         if bool(parameters[6].valueAsText) != bool(parameters[7].valueAsText):
             parameters[6 if not parameters[6].valueAsText else 7].setErrorMessage(
                 "Provide both test imagery and test CHM directories, or leave both empty.")
+        if len(parameters) > 8 and parameters[8].valueAsText:
+            try:
+                validate_pretrained_chm_path(parameters[8].valueAsText, parameters[5].valueAsText)
+            except (ValueError, OSError) as exc:
+                parameters[8].setErrorMessage(str(exc))
 
     def execute(self, parameters, messages):
+        try:
+            arcpy.SetProgressor("default", "Loading CHM datasets and initializing model...")
+            self._execute(parameters, messages)
+        finally:
+            arcpy.ResetProgressor()
+
+    def _execute(self, parameters, messages):
         image_dir = parameters[0].valueAsText
         label_dir = parameters[1].valueAsText
         model_choice = parameters[2].valueAsText
         num_epochs = parameters[3].value
         batch_size = parameters[4].value
         save_path = parameters[5].valueAsText
+        pretrained_model = parameters[8].valueAsText if len(parameters) > 8 else None
+        validate_pretrained_chm_path(pretrained_model, save_path)
         test_image_dir = parameters[6].valueAsText if len(parameters) > 6 else None
         test_label_dir = parameters[7].valueAsText if len(parameters) > 7 else None
         if bool(test_image_dir) != bool(test_label_dir):
@@ -407,9 +486,7 @@ class TrainCHM:
                                  f"{len(test_dataset.unpaired_labels)} CHM.")
             check_test_separation(full_dataset, test_dataset)
             arcpy.AddMessage(f"Optional testing dataset: {len(test_dataset)} tile pairs; evaluated only after training.")
-            arcpy.AddWarning("Use separate source areas for independent testing. Different files may still contain "
-                             "overlapping imagery or repeated observations of the same location.")
-
+            
         # Split Data
         train_size = int(0.8 * len(full_dataset))
         val_size = len(full_dataset) - train_size
@@ -425,6 +502,11 @@ class TrainCHM:
         else:
             raise ValueError("Only UNet is supported by the CHM tools.")
 
+        if pretrained_model:
+            arcpy.AddMessage(f"Loading pretrained CHM U-Net weights: {pretrained_model}")
+            matched = load_pretrained_chm(model, pretrained_model)
+            arcpy.AddMessage(f"Loaded {matched} model tensors. Starting a new optimizer and epoch counter.")
+
         # Initialize Loss, Optimizer, and Scheduler
         criterion = CombinedCHMLoss(alpha=0.85, data_range=40.0).to(device) 
         optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -432,17 +514,42 @@ class TrainCHM:
 
         best_val_loss = float('inf')
 
+        epoch_metrics_path = os.path.splitext(save_path)[0] + ".epoch_metrics.csv"
+        epoch_fields = ["EPOCH", "TRAIN_LOSS", "VALIDATION_LOSS", "TRAIN_MAE", "TRAIN_RMSE",
+                        "TRAIN_BIAS", "VALIDATION_MAE", "VALIDATION_RMSE", "VALIDATION_BIAS",
+                        "LEARNING_RATE", "NEXT_LEARNING_RATE", "EPOCH_SECONDS", "TOTAL_SECONDS",
+                        "TRAIN_TILE_PAIRS", "VALIDATION_TILE_PAIRS", "TRAIN_VALID_PIXELS",
+                        "VALIDATION_VALID_PIXELS", "IS_BEST_CHECKPOINT"]
+        with open(epoch_metrics_path, "w", encoding="utf-8-sig", newline="") as stream:
+            csv.writer(stream).writerow(epoch_fields)
+        arcpy.AddMessage(f"Epoch metrics CSV: {epoch_metrics_path}")
+        training_started = time.perf_counter()
+        total_batches = num_epochs * (len(train_loader) + len(val_loader))
+        completed_batches = 0
+        arcpy.SetProgressor("step", "Training and validating CHM model...", 0, total_batches, 1)
+
+        def advance_batch_progress():
+            nonlocal completed_batches
+            completed_batches += 1
+            arcpy.SetProgressorPosition(completed_batches)
+
         # Training Loop
         for epoch in range(num_epochs):
+            epoch_started = time.perf_counter()
+            learning_rate = optimizer.param_groups[0]["lr"]
             model.train() 
             train_loss = 0.0
             train_valid_pixels = 0
+            train_absolute = train_squared = train_signed = 0.0
             
             for batch_idx, (images, labels, valid_mask) in enumerate(train_loader):
+                arcpy.SetProgressorLabel(
+                    f"Epoch {epoch + 1}/{num_epochs}: training batch {batch_idx + 1}/{len(train_loader)}")
                 images, labels = images.to(device), labels.to(device)
                 valid_mask = valid_mask.to(device)
                 valid_count = int(valid_mask.sum().item())
                 if not valid_count:
+                    advance_batch_progress()
                     continue
                 
                 optimizer.zero_grad()
@@ -453,6 +560,11 @@ class TrainCHM:
                 
                 train_loss += loss.item() * valid_count
                 train_valid_pixels += valid_count
+                absolute, squared, signed = masked_height_error_sums(predictions, labels, valid_mask)
+                train_absolute += absolute
+                train_squared += squared
+                train_signed += signed
+                advance_batch_progress()
                 
             if not train_valid_pixels:
                 raise ValueError("Training partition contains no valid CHM pixels.")
@@ -461,18 +573,27 @@ class TrainCHM:
             model.eval() 
             val_loss = 0.0
             val_valid_pixels = 0
+            val_absolute = val_squared = val_signed = 0.0
             
             with torch.no_grad(): 
-                for images, labels, valid_mask in val_loader:
+                for batch_idx, (images, labels, valid_mask) in enumerate(val_loader):
+                    arcpy.SetProgressorLabel(
+                        f"Epoch {epoch + 1}/{num_epochs}: validation batch {batch_idx + 1}/{len(val_loader)}")
                     images, labels = images.to(device), labels.to(device)
                     valid_mask = valid_mask.to(device)
                     valid_count = int(valid_mask.sum().item())
                     if not valid_count:
+                        advance_batch_progress()
                         continue
                     predictions = model(images)
                     loss = criterion(predictions, labels, valid_mask)
                     val_loss += loss.item() * valid_count
                     val_valid_pixels += valid_count
+                    absolute, squared, signed = masked_height_error_sums(predictions, labels, valid_mask)
+                    val_absolute += absolute
+                    val_squared += squared
+                    val_signed += signed
+                    advance_batch_progress()
                     
             if not val_valid_pixels:
                 raise ValueError("Validation partition contains no valid CHM pixels.")
@@ -484,19 +605,37 @@ class TrainCHM:
             arcpy.AddMessage(log_msg)
             
             # Checkpointing
-            if avg_val_loss < best_val_loss:
+            is_best_checkpoint = avg_val_loss < best_val_loss
+            if is_best_checkpoint:
+                arcpy.SetProgressorLabel(f"Epoch {epoch + 1}/{num_epochs}: saving best checkpoint...")
                 best_val_loss = avg_val_loss
                 torch.save(model.state_dict(), save_path)
-                metadata_path = save_chm_metadata(save_path, epoch + 1, best_val_loss, batch_size)
+                metadata_path = save_chm_metadata(save_path, epoch + 1, best_val_loss, batch_size, pretrained_model)
                 arcpy.AddMessage(f"Model metadata saved to {metadata_path}")
                 arcpy.AddMessage(f"  --> Best model saved to {save_path} (Val Loss improved to {best_val_loss:.4f})")
+
+            arcpy.SetProgressorLabel(f"Epoch {epoch + 1}/{num_epochs}: writing epoch metrics...")
+            # Close the file after every epoch so completed rows survive a later failure.
+            now = time.perf_counter()
+            with open(epoch_metrics_path, "a", encoding="utf-8", newline="") as stream:
+                csv.writer(stream).writerow([
+                    epoch + 1, avg_train_loss, avg_val_loss,
+                    train_absolute / train_valid_pixels, math.sqrt(train_squared / train_valid_pixels),
+                    train_signed / train_valid_pixels, val_absolute / val_valid_pixels,
+                    math.sqrt(val_squared / val_valid_pixels), val_signed / val_valid_pixels,
+                    learning_rate, optimizer.param_groups[0]["lr"], now - epoch_started,
+                    now - training_started, len(train_dataset), len(val_dataset),
+                    train_valid_pixels, val_valid_pixels, is_best_checkpoint,
+                ])
 
         if test_dataset is not None:
             if not math.isfinite(best_val_loss):
                 raise ValueError("No valid best checkpoint was saved; testing cannot proceed.")
+            arcpy.SetProgressor("default", "Loading best checkpoint for testing...")
             arcpy.AddMessage("Loading the best validation checkpoint for testing...")
             model.load_state_dict(torch.load(save_path, map_location=device, weights_only=True))
             metrics = evaluate_chm_test(model, test_dataset, batch_size, device)
+            arcpy.SetProgressor("default", "Saving test metrics and model metadata...")
             metadata_path = os.path.splitext(save_path)[0] + ".metadata.json"
             with open(metadata_path, encoding="utf-8") as stream:
                 metadata = json.load(stream)
