@@ -20,7 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 INPUT_NORMALIZATION_DIVISOR = 255.0
 
 
-def save_chm_metadata(weights_path, epoch, validation_loss, batch_size, pretrained_model=None):
+def save_chm_metadata(weights_path, epoch, validation_loss, batch_size, pretrained_model=None, early_stopping_patience=5):
     """Record the fixed preprocessing beside each best U-Net checkpoint."""
     metadata = {
         "schema_version": 1,
@@ -38,6 +38,7 @@ def save_chm_metadata(weights_path, epoch, validation_loss, batch_size, pretrain
         },
         "training": {
             "batch_size": int(batch_size),
+            "early_stopping_patience": int(early_stopping_patience),
             "initial_weights": os.path.abspath(pretrained_model) if pretrained_model else None,
             "initialization": "pretrained" if pretrained_model else "random",
             "optimizer_restored": False,
@@ -422,7 +423,13 @@ class TrainCHM:
             displayName="Pretrained Model Weights (.pth, Optional)", name="pretrained_model",
             datatype="DEFile", parameterType="Optional", direction="Input")
         pretrained_model.filter.list = ["pth"]
-        return [img_dir, lbl_dir, model_type, epochs, batch_size, out_pth, test_img_dir, test_lbl_dir, pretrained_model]
+        early_stopping_patience = arcpy.Parameter(
+            displayName="Early Stopping Patience (Epochs; 0 Disables)", name="early_stopping_patience",
+            datatype="GPLong", parameterType="Required", direction="Input")
+        early_stopping_patience.value = 5
+        early_stopping_patience.filter.type = "Range"
+        early_stopping_patience.filter.list = [0, 2147483647]
+        return [img_dir, lbl_dir, model_type, epochs, batch_size, out_pth, test_img_dir, test_lbl_dir, pretrained_model, early_stopping_patience]
 
     def isLicensed(self):
         return True
@@ -439,6 +446,8 @@ class TrainCHM:
                 validate_pretrained_chm_path(parameters[8].valueAsText, parameters[5].valueAsText)
             except (ValueError, OSError) as exc:
                 parameters[8].setErrorMessage(str(exc))
+        if len(parameters) > 9 and parameters[9].value is not None and int(parameters[9].value) < 0:
+            parameters[9].setErrorMessage("Early stopping patience must be zero or greater.")
 
     def execute(self, parameters, messages):
         try:
@@ -453,6 +462,9 @@ class TrainCHM:
         model_choice = parameters[2].valueAsText
         num_epochs = parameters[3].value
         batch_size = parameters[4].value
+        patience = int(parameters[9].value) if len(parameters) > 9 and parameters[9].value is not None else 5
+        if patience < 0:
+            raise ValueError("Early stopping patience must be zero or greater.")
         save_path = parameters[5].valueAsText
         pretrained_model = parameters[8].valueAsText if len(parameters) > 8 else None
         validate_pretrained_chm_path(pretrained_model, save_path)
@@ -513,13 +525,17 @@ class TrainCHM:
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
 
         best_val_loss = float('inf')
+        epochs_without_improvement = 0
+        epochs_completed = 0
+        early_stopped = False
+        arcpy.AddMessage(f"Early stopping patience: {patience} epochs (0 disables).")
 
         epoch_metrics_path = os.path.splitext(save_path)[0] + ".epoch_metrics.csv"
         epoch_fields = ["EPOCH", "TRAIN_LOSS", "VALIDATION_LOSS", "TRAIN_MAE", "TRAIN_RMSE",
                         "TRAIN_BIAS", "VALIDATION_MAE", "VALIDATION_RMSE", "VALIDATION_BIAS",
                         "LEARNING_RATE", "NEXT_LEARNING_RATE", "EPOCH_SECONDS", "TOTAL_SECONDS",
                         "TRAIN_TILE_PAIRS", "VALIDATION_TILE_PAIRS", "TRAIN_VALID_PIXELS",
-                        "VALIDATION_VALID_PIXELS", "IS_BEST_CHECKPOINT"]
+                        "VALIDATION_VALID_PIXELS", "IS_BEST_CHECKPOINT", "EPOCHS_WITHOUT_IMPROVEMENT", "EARLY_STOPPED"]
         with open(epoch_metrics_path, "w", encoding="utf-8-sig", newline="") as stream:
             csv.writer(stream).writerow(epoch_fields)
         arcpy.AddMessage(f"Epoch metrics CSV: {epoch_metrics_path}")
@@ -609,10 +625,14 @@ class TrainCHM:
             if is_best_checkpoint:
                 arcpy.SetProgressorLabel(f"Epoch {epoch + 1}/{num_epochs}: saving best checkpoint...")
                 best_val_loss = avg_val_loss
+                epochs_without_improvement = 0
                 torch.save(model.state_dict(), save_path)
-                metadata_path = save_chm_metadata(save_path, epoch + 1, best_val_loss, batch_size, pretrained_model)
+                metadata_path = save_chm_metadata(save_path, epoch + 1, best_val_loss, batch_size, pretrained_model, patience)
                 arcpy.AddMessage(f"Model metadata saved to {metadata_path}")
                 arcpy.AddMessage(f"  --> Best model saved to {save_path} (Val Loss improved to {best_val_loss:.4f})")
+            else:
+                epochs_without_improvement += 1
+            early_stopped = patience > 0 and epochs_without_improvement >= patience
 
             arcpy.SetProgressorLabel(f"Epoch {epoch + 1}/{num_epochs}: writing epoch metrics...")
             # Close the file after every epoch so completed rows survive a later failure.
@@ -626,7 +646,25 @@ class TrainCHM:
                     learning_rate, optimizer.param_groups[0]["lr"], now - epoch_started,
                     now - training_started, len(train_dataset), len(val_dataset),
                     train_valid_pixels, val_valid_pixels, is_best_checkpoint,
+                    epochs_without_improvement, early_stopped,
                 ])
+            epochs_completed = epoch + 1
+            if early_stopped:
+                arcpy.AddMessage(f"Early stopping at epoch {epochs_completed}: validation loss has not improved "
+                                 f"for {patience} epochs. Best validation loss: {best_val_loss:.4f}.")
+                break
+
+        if math.isfinite(best_val_loss):
+            arcpy.SetProgressor("default", "Saving training summary...")
+            metadata_path = os.path.splitext(save_path)[0] + ".metadata.json"
+            with open(metadata_path, encoding="utf-8") as stream:
+                metadata = json.load(stream)
+            metadata["training"].update({
+                "requested_epochs": int(num_epochs), "completed_epochs": epochs_completed,
+                "early_stopped": early_stopped, "early_stopping_patience": patience,
+                "stop_reason": "early_stopping" if early_stopped else "maximum_epochs",
+            })
+            write_chm_json(metadata_path, metadata)
 
         if test_dataset is not None:
             if not math.isfinite(best_val_loss):
