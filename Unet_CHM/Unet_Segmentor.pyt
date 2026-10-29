@@ -17,15 +17,24 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
+# Resolve shared model helpers beside this toolbox, including when ArcGIS loads by path.
+import importlib.util as _importlib_util
+from pathlib import Path as _ModelPath
+_model_spec = _importlib_util.spec_from_file_location(
+    "_chm_models", _ModelPath(__file__).resolve().with_name("chm_models.py"))
+_chm_models = _importlib_util.module_from_spec(_model_spec)
+_model_spec.loader.exec_module(_chm_models)
+
 INPUT_NORMALIZATION_DIVISOR = 255.0
 
 
-def save_chm_metadata(weights_path, epoch, validation_loss, batch_size, pretrained_model=None, early_stopping_patience=5):
-    """Record the fixed preprocessing beside each best U-Net checkpoint."""
+def save_chm_metadata(weights_path, epoch, validation_loss, batch_size, pretrained_model=None, early_stopping_patience=5, model_type="UNet"):
+    """Record the selected architecture and fixed preprocessing beside the best checkpoint."""
     metadata = {
         "schema_version": 1,
         "task": "chm_regression",
-        "model_type": "UNet",
+        "model_type": model_type,
+        "model_config": _chm_models.model_config(model_type),
         "weights_file": os.path.basename(weights_path),
         "input_channels": 4,
         "output_channels": 1,
@@ -84,36 +93,9 @@ def validate_pretrained_chm_path(pretrained_path, output_path):
             raise ValueError("Choose a different output .pth path so the pretrained weights are preserved.")
 
 
-def load_pretrained_chm(model, pretrained_path):
-    """Load complete compatible U-Net weights; do not silently skip layers."""
-    metadata_path = os.path.splitext(pretrained_path)[0] + ".metadata.json"
-    if os.path.isfile(metadata_path):
-        with open(metadata_path, encoding="utf-8-sig") as stream:
-            metadata = json.load(stream)
-        if (metadata.get("model_type") != "UNet" or metadata.get("input_channels") != 4
-                or metadata.get("output_channels") != 1):
-            raise ValueError("Pretrained metadata must describe a four-band, one-output CHM U-Net.")
-        if metadata.get("preprocessing", {}).get("normalization_divisor") != INPUT_NORMALIZATION_DIVISOR:
-            raise ValueError("Pretrained model metadata must use the fixed normalization divisor of 255.")
-    checkpoint = torch.load(pretrained_path, map_location="cpu", weights_only=True)
-    if not isinstance(checkpoint, dict):
-        raise ValueError("Pretrained .pth must contain a PyTorch state dictionary.")
-    state = checkpoint.get("state_dict", checkpoint.get("model_state_dict", checkpoint))
-    if not isinstance(state, dict) or not state:
-        raise ValueError("Pretrained checkpoint has no model state dictionary.")
-    cleaned = {}
-    for key, value in state.items():
-        if not isinstance(key, str) or not isinstance(value, torch.Tensor):
-            raise ValueError("Pretrained state dictionary must map tensor names to tensors.")
-        name = key.removeprefix("module.")
-        if name in cleaned:
-            raise ValueError(f"Duplicate pretrained tensor name: {name}")
-        cleaned[name] = value
-    expected = model.state_dict()
-    if set(cleaned) != set(expected) or any(cleaned[name].shape != expected[name].shape for name in expected if name in cleaned):
-        raise ValueError("Pretrained weights do not match this four-band CHM U-Net architecture. All tensor names and shapes must match.")
-    model.load_state_dict(cleaned, strict=True)
-    return len(cleaned)
+def load_pretrained_chm(model, pretrained_path, model_type="UNet"):
+    """Load complete compatible weights for the selected CHM architecture."""
+    return _chm_models.load_chm_weights(model, pretrained_path, model_type)
 
 
 def masked_height_error_sums(predictions, labels, valid_mask):
@@ -352,7 +334,7 @@ class Toolbox:
 class TrainCHM:
     def __init__(self):
         self.label = "Train CHM Regressor"
-        self.description = "Trains a UNet model to predict Canopy Height Models from 4-band imagery."
+        self.description = "Trains a UNet, ResUNet, or UNet++ model to predict Canopy Height Models from 4-band imagery."
         self.canRunInBackground = False
 
     def getParameterInfo(self):
@@ -381,9 +363,9 @@ class TrainCHM:
             parameterType="Required",
             direction="Input"
         )
-        model_type.filter.list = ["UNet"]
+        model_type.filter.list = list(_chm_models.MODEL_TYPES)
         model_type.value = "UNet"
-        # model_type.enabled = False  # Preserve existing parameter positions.
+        model_type.enabled = True
 
         # 3. Hyperparameters
         epochs = arcpy.Parameter(
@@ -509,14 +491,12 @@ class TrainCHM:
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
 
         # Initialize Model
-        if model_choice == "UNet":
-            model = UNetRegressor(in_channels=4, out_channels=1).to(device)
-        else:
-            raise ValueError("Only UNet is supported by the CHM tools.")
+        model = _chm_models.build_chm_model(model_choice, UNetRegressor).to(device)
+        arcpy.AddMessage(f"Model: {model_choice}; parameters: {sum(p.numel() for p in model.parameters()):,}")
 
         if pretrained_model:
-            arcpy.AddMessage(f"Loading pretrained CHM U-Net weights: {pretrained_model}")
-            matched = load_pretrained_chm(model, pretrained_model)
+            arcpy.AddMessage(f"Loading pretrained CHM {model_choice} weights: {pretrained_model}")
+            matched = load_pretrained_chm(model, pretrained_model, model_choice)
             arcpy.AddMessage(f"Loaded {matched} model tensors. Starting a new optimizer and epoch counter.")
 
         # Initialize Loss, Optimizer, and Scheduler
@@ -627,7 +607,7 @@ class TrainCHM:
                 best_val_loss = avg_val_loss
                 epochs_without_improvement = 0
                 torch.save(model.state_dict(), save_path)
-                metadata_path = save_chm_metadata(save_path, epoch + 1, best_val_loss, batch_size, pretrained_model, patience)
+                metadata_path = save_chm_metadata(save_path, epoch + 1, best_val_loss, batch_size, pretrained_model, patience, model_choice)
                 arcpy.AddMessage(f"Model metadata saved to {metadata_path}")
                 arcpy.AddMessage(f"  --> Best model saved to {save_path} (Val Loss improved to {best_val_loss:.4f})")
             else:

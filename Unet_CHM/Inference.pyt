@@ -13,6 +13,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Resolve shared model helpers beside this toolbox, including when ArcGIS loads by path.
+import importlib.util as _importlib_util
+from pathlib import Path as _ModelPath
+_model_spec = _importlib_util.spec_from_file_location(
+    "_chm_models", _ModelPath(__file__).resolve().with_name("chm_models.py"))
+_chm_models = _importlib_util.module_from_spec(_model_spec)
+_model_spec.loader.exec_module(_chm_models)
+
 INPUT_NORMALIZATION_DIVISOR = 255.0
 
 # =========================================================
@@ -132,7 +140,7 @@ def publish_geodatabase_raster(tiff_path, output, overwrite):
 class PredictCHM:
     def __init__(self):
         self.label = "Predict CHM from Imagery"
-        self.description = "Uses a trained UNet model to generate a Canopy Height Model from a 4-band raster."
+        self.description = "Uses a trained UNet, ResUNet, or UNet++ model to generate a Canopy Height Model from a 4-band raster."
         self.canRunInBackground = False
 
     def getParameterInfo(self):
@@ -159,9 +167,9 @@ class PredictCHM:
             parameterType="Required",
             direction="Input"
         )
-        model_type.filter.list = ["UNet"]
+        model_type.filter.list = list(_chm_models.MODEL_TYPES)
         model_type.value = "UNet"
-        model_type.enabled = False  # Preserve existing parameter positions.
+        model_type.enabled = True
         
         normalization_factor = arcpy.Parameter(
             displayName="Input Normalization Divisor (Fixed at 255)",
@@ -240,11 +248,9 @@ class PredictCHM:
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         arcpy.AddMessage(f"Initializing inference on device: {device}")
-        arcpy.AddMessage("Loading U-Net architecture and trained weights...")
-        if model_choice != "UNet":
-            raise ValueError("Only UNet is supported by the CHM tools.")
-        model = UNetRegressor(in_channels=4, out_channels=1).to(device)
-        model.load_state_dict(torch.load(model_weights, map_location=device, weights_only=True))
+        arcpy.AddMessage(f"Loading {model_choice} architecture and trained weights...")
+        model = _chm_models.build_chm_model(model_choice, UNetRegressor).to(device)
+        _chm_models.load_chm_weights(model, model_weights, model_choice)
         model.eval()
         arcpy.AddMessage(f"Opening input raster: {in_raster}")
         temporary = None
